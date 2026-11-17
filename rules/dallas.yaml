@@ -1,0 +1,18 @@
+division: Dallas
+morning_checks:
+  step_2_prior_day:
+    status: "Assigned"
+    exclude_types:
+      - "Address Assign"
+      - "Plan Review"
+  step_3_unassigned:
+    status: "Unassigned"
+  step_5_cancellations:
+    resolutions:
+      - "Cancelled in"
+      - "Not Ready"
+    special_rules:
+      - builder: "DWH"
+        type: "Slab Elevation"
+        action: "zero_fee"
+        note: "No fee per CB"

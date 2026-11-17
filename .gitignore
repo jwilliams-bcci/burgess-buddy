@@ -1,0 +1,20 @@
+# Environments & Secrets (NEVER commit)
+.env
+.env.*
+!.env.example
+*service-account*.json
+*credentials*.json
+*.pem
+*.key
+
+# Virtual Environments & Playwright Browsers
+.venv/
+venv/
+.playwright/
+
+# Python Cache & Logs
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+.pytest_cache/
