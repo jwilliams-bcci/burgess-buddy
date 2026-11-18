@@ -536,6 +536,21 @@ def execute_job(
             parameters["executionId"] = active_execution_id
             parameters["triggerType"] = trigger_type
             parameters["dryRun"] = effective_dry_run
+            if run_params:
+                parameters["runParameters"] = dict(run_params)
+                raw_extract_type = _clean_optional_str(
+                    _get_field(run_params, "extractType", "extract_type", "ExtractType")
+                )
+                if raw_extract_type:
+                    parameters["extractType"] = raw_extract_type
+                for list_key, target_key in (
+                    (("items", "markedItems", "marked_items", "selectedItems", "selected_items"), "items"),
+                    (("poNumbers", "po_numbers", "PONumbers"), "poNumbers"),
+                    (("invoiceNumbers", "invoice_numbers", "InvoiceNumbers"), "invoiceNumbers"),
+                ):
+                    list_val = _get_field(run_params, *list_key)
+                    if list_val:
+                        parameters[target_key] = list_val
             if resolved_po_number:
                 parameters["po"] = resolved_po_number
                 parameters["poNumber"] = resolved_po_number

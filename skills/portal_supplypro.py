@@ -127,12 +127,121 @@ def _coerce_optional_bool(val: Any) -> Optional[bool]:
     return None
 
 
+def _coerce_str_list(val: Any) -> list[str]:
+    """Normalizes a list of strings, JSON array string, or comma-separated string into a clean list[str]."""
+    if not val:
+        return []
+    if isinstance(val, list):
+        return [str(v).strip() for v in val if v is not None and str(v).strip()]
+    if isinstance(val, str):
+        text = val.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return [str(v).strip() for v in parsed if v is not None and str(v).strip()]
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        return [part.strip() for part in text.split(",") if part.strip()]
+    return [str(val).strip()] if str(val).strip() else []
+
+
+def extract_marked_items(params: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Extracts a normalized list of target order descriptors (`{"poNumber": ..., "invoiceNumber": ...}`)
+    from `items` (list of objects), `poNumbers` / `po_numbers`, and/or `invoiceNumbers` / `invoice_numbers`.
+    """
+    if not isinstance(params, dict):
+        return []
+
+    normalized_items: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str]] = set()
+
+    def _add_entry(
+        po_val: Optional[str] = None,
+        inv_val: Optional[str] = None,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> None:
+        clean_po = str(po_val).strip() if po_val is not None and str(po_val).strip() else None
+        clean_inv = str(inv_val).strip() if inv_val is not None and str(inv_val).strip() else None
+        if not clean_po and not clean_inv:
+            return
+        dedup_key = (clean_inv or "", clean_po or "")
+        if dedup_key in seen_keys:
+            return
+        seen_keys.add(dedup_key)
+        entry: dict[str, Any] = {}
+        if extra:
+            entry.update(extra)
+        if clean_po:
+            entry["poNumber"] = clean_po
+        if clean_inv:
+            entry["invoiceNumber"] = clean_inv
+        normalized_items.append(entry)
+
+    raw_items = _get_case_insensitive(
+        params,
+        "items",
+        "markedItems",
+        "marked_items",
+        "selectedItems",
+        "selected_items",
+    )
+    if isinstance(raw_items, str) and raw_items.strip().startswith("["):
+        try:
+            raw_items = json.loads(raw_items.strip())
+        except (json.JSONDecodeError, TypeError, ValueError):
+            raw_items = None
+
+    if isinstance(raw_items, list):
+        for elem in raw_items:
+            if isinstance(elem, dict):
+                po_v = _get_case_insensitive(elem, "poNumber", "po_number", "po", "PONumber")
+                inv_v = _get_case_insensitive(elem, "invoiceNumber", "invoice_number", "invoice", "InvoiceNumber")
+                note_v = _get_case_insensitive(elem, "userNote", "user_note", "UserNote")
+                ext_v = _get_case_insensitive(elem, "extractType", "extract_type", "ExtractType")
+                extra_fields: dict[str, Any] = {}
+                if note_v is not None and str(note_v).strip():
+                    extra_fields["userNote"] = str(note_v).strip()
+                if ext_v is not None and str(ext_v).strip():
+                    extra_fields["extractType"] = str(ext_v).strip()
+                # Preserve any inline expected fields if supplied on the item object
+                for field_name in ("builderName", "BuilderName", "propertyAddress", "PropertyAddress", "inspectionType", "InspectionType", "fee", "Fee", "inspectionId", "InspectionID"):
+                    if field_name in elem and elem[field_name] is not None:
+                        extra_fields[field_name] = elem[field_name]
+                _add_entry(po_v, inv_v, extra=extra_fields)
+            elif elem is not None and str(elem).strip():
+                _add_entry(po_val=str(elem).strip())
+
+    po_list = _coerce_str_list(
+        _get_case_insensitive(params, "poNumbers", "po_numbers", "PONumbers")
+    )
+    inv_list = _coerce_str_list(
+        _get_case_insensitive(params, "invoiceNumbers", "invoice_numbers", "InvoiceNumbers")
+    )
+
+    if po_list and inv_list and len(po_list) == len(inv_list) and not normalized_items:
+        for po_v, inv_v in zip(po_list, inv_list):
+            _add_entry(po_val=po_v, inv_val=inv_v)
+    else:
+        for po_v in po_list:
+            _add_entry(po_val=po_v)
+        for inv_v in inv_list:
+            _add_entry(inv_val=inv_v)
+
+    return normalized_items
+
+
 def unpack_skill_parameters(raw_parameters: Any) -> dict[str, Any]:
     """
     Unpacks nested `SiteLogin`, `Emailer`, and `RunParametersJson` / `runParameters`
     dictionaries from `job["parameters"]`, while normalizing both `camelCase` and
     `snake_case` keys (`postedDate` / `posted_date`, `poNumber` / `po_number`,
-    `dryRun` / `dry_run`, `invoiceNumber` / `invoice_number`, `userNote` / `user_note`).
+    `items`, `poNumbers` / `po_numbers`, `invoiceNumbers` / `invoice_numbers`,
+    `extractType` / `extract_type`, `dryRun` / `dry_run`, `invoiceNumber` / `invoice_number`,
+    `userNote` / `user_note`).
     Safely falls back to `{}` for `None`, `""`, or `{}`.
     """
     params = _safe_json_dict(raw_parameters)
@@ -154,6 +263,13 @@ def unpack_skill_parameters(raw_parameters: Any) -> dict[str, Any]:
         for k, v in layer.items():
             if v is not None and v != "":
                 merged[k] = v
+
+    # Normalize extractType (Revenue | Zero | Credit)
+    ext_val = _get_case_insensitive(run_params, "extractType", "extract_type", "ExtractType") or _get_case_insensitive(
+        merged, "extractType", "extract_type", "ExtractType"
+    )
+    if ext_val is not None and str(ext_val).strip():
+        merged["extractType"] = str(ext_val).strip()
 
     # Normalize camelCase and snake_case runtime keys
     po_val = _get_case_insensitive(merged, "poNumber", "po_number", "po", "PONumber")
@@ -186,6 +302,18 @@ def unpack_skill_parameters(raw_parameters: Any) -> dict[str, Any]:
     if dry_val is not None:
         merged["dryRun"] = dry_val
 
+    po_nums = _coerce_str_list(_get_case_insensitive(merged, "poNumbers", "po_numbers", "PONumbers"))
+    if po_nums:
+        merged["poNumbers"] = po_nums
+
+    inv_nums = _coerce_str_list(_get_case_insensitive(merged, "invoiceNumbers", "invoice_numbers", "InvoiceNumbers"))
+    if inv_nums:
+        merged["invoiceNumbers"] = inv_nums
+
+    marked = extract_marked_items(merged)
+    if marked:
+        merged["items"] = marked
+
     return merged
 
 
@@ -201,6 +329,9 @@ class SupplyProParameters(BaseModel):
     division: Optional[str] = Field(default=None)
     po: Optional[str] = Field(default=None, alias="poNumber")
     po_queue: list[str] = Field(default_factory=list, alias="poQueue")
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    po_numbers: list[str] = Field(default_factory=list, alias="poNumbers")
+    invoice_numbers: list[str] = Field(default_factory=list, alias="invoiceNumbers")
     builder_name: Optional[str] = Field(default=None, alias="builderName")
     property_address: Optional[str] = Field(default=None, alias="propertyAddress")
     inspection_type: Optional[str] = Field(default=None, alias="inspectionType")
@@ -1287,6 +1418,96 @@ def _is_session_redirect_error(err: Exception, driver: Any) -> bool:
     return "login.asp" in msg or "session redirected to login" in msg or "session expired" in msg
 
 
+def _resolve_marked_orders(
+    marked_items: list[dict[str, Any]],
+    client: BurgessApiClient,
+    parsed_params: SupplyProParameters,
+    explicit_extract_type: Optional[str],
+    active_posted_date: Optional[str],
+    active_user_note: Optional[str],
+) -> list[dict[str, Any]]:
+    """
+    Resolves a list of user-marked items (`items`, `poNumbers`, `invoiceNumbers`)
+    into normalized expected order records for single-session SupplyPro processing.
+    """
+    resolved_orders: list[dict[str, Any]] = []
+    seen_records: set[tuple[str, str]] = set()
+
+    for item_desc in marked_items:
+        item_po = _get_case_insensitive(item_desc, "poNumber", "po_number", "po", "PONumber")
+        item_inv = _get_case_insensitive(item_desc, "invoiceNumber", "invoice_number", "invoice", "InvoiceNumber")
+        item_note = _get_case_insensitive(item_desc, "userNote", "user_note") or active_user_note
+        item_ext = (
+            _get_case_insensitive(item_desc, "extractType", "extract_type")
+            or explicit_extract_type
+        )
+        clean_po = str(item_po).strip() if item_po is not None and str(item_po).strip() else None
+        clean_inv = str(item_inv).strip() if item_inv is not None and str(item_inv).strip() else None
+        clean_ext = str(item_ext).strip() if item_ext is not None and str(item_ext).strip() else None
+
+        raw_matches: list[dict[str, Any]] = []
+        try:
+            raw_matches = client.get_pending_supplypro_orders(
+                extract_type=clean_ext,
+                limit=parsed_params.batch_limit,
+                posted_date=active_posted_date,
+                invoice_number=clean_inv,
+                po_number=clean_po,
+            )
+            if not raw_matches and clean_ext is not None:
+                # Retry without extractType filter so record is found regardless of fee sign
+                raw_matches = client.get_pending_supplypro_orders(
+                    extract_type=None,
+                    limit=parsed_params.batch_limit,
+                    posted_date=active_posted_date,
+                    invoice_number=clean_inv,
+                    po_number=clean_po,
+                )
+        except Exception as lookup_err:
+            logger.warning(
+                "Marked-item lookup via get_pending_supplypro_orders failed (invoice=%s, po=%s): %s",
+                clean_inv,
+                clean_po,
+                lookup_err,
+            )
+
+        matched_records = [
+            normalize_pending_order_record(r)
+            for r in raw_matches
+            if _get_case_insensitive(r, "poNumber", "PONumber", "po")
+        ]
+
+        # If both invoiceNumber and poNumber were specified and multiple rows returned, narrow by invoiceNumber
+        if clean_inv and len(matched_records) > 1:
+            exact_inv_matches = [
+                r for r in matched_records if str(r.get("invoiceNumber") or "").strip() == clean_inv
+            ]
+            if exact_inv_matches:
+                matched_records = exact_inv_matches
+
+        if not matched_records and clean_po:
+            # Check if inline expected fields were provided on item_desc, else fallback to DB query
+            if _get_case_insensitive(item_desc, "builderName", "BuilderName"):
+                fallback_rec = normalize_pending_order_record(item_desc)
+            else:
+                fallback_rec = fetch_expected_order_from_db(clean_po, fallback_params=parsed_params)
+                if clean_inv and not fallback_rec.get("invoiceNumber"):
+                    fallback_rec["invoiceNumber"] = clean_inv
+            matched_records = [fallback_rec]
+
+        for rec in matched_records:
+            if item_note:
+                rec["userNote"] = str(item_note).strip()
+            if clean_ext:
+                rec["extractType"] = clean_ext
+            rec_key = (str(rec.get("invoiceNumber") or ""), str(rec.get("poNumber") or ""))
+            if rec_key not in seen_records:
+                seen_records.add(rec_key)
+                resolved_orders.append(rec)
+
+    return resolved_orders
+
+
 def run_supplypro_sync(
     parameters: dict[str, Any],
     allowed_skills: Optional[list[str]] = None,
@@ -1302,7 +1523,10 @@ def run_supplypro_sync(
     """
     Entry point for the SupplyPro PortalSync skill.
 
-    Supports both:
+    Supports:
+      - Marked list mode (`items`, `poNumbers`, `invoiceNumbers` in `RunParametersJson` for
+        "Reconcile Marked" — resolves all selected records and processes them sequentially in
+        a single SupplyPro browser/login session).
       - Targeted single-order mode (when `invoice_number` or `po` is supplied via CLI or `runParameters`,
         querying `GET /api/accounting/supplypro/pending` with `invoiceNumber`/`poNumber` to bypass
         `FlaggedForReview` exclusion and optionally applying `user_note` accountant override context).
@@ -1347,15 +1571,37 @@ def run_supplypro_sync(
     try:
         # Build the queue of expected order records to process
         orders_to_process: list[dict[str, Any]] = []
-        single_order_mode = bool(active_po_number or active_invoice_number)
+        marked_items = parsed_params.items or extract_marked_items(unpacked_params)
+        marked_list_mode = bool(marked_items)
+        single_order_mode = bool(not marked_list_mode and (active_po_number or active_invoice_number))
 
-        if single_order_mode:
+        raw_run_params = _safe_json_dict(
+            _get_case_insensitive(
+                parameters,
+                "runParameters",
+                "run_parameters",
+                "runParametersJson",
+                "RunParametersJson",
+                "run_parameters_json",
+            )
+        )
+        explicit_extract_type = _get_case_insensitive(
+            raw_run_params, "extractType", "extract_type", "ExtractType"
+        ) or _get_case_insensitive(parameters, "extractType", "extract_type", "ExtractType")
+
+        if marked_list_mode:
+            orders_to_process = _resolve_marked_orders(
+                marked_items=marked_items,
+                client=client,
+                parsed_params=parsed_params,
+                explicit_extract_type=str(explicit_extract_type).strip() if explicit_extract_type else None,
+                active_posted_date=active_posted_date,
+                active_user_note=active_user_note,
+            )
+        elif single_order_mode:
             # For single-invoice/PO lookups, leave extractType as None unless explicitly
             # specified in runParameters so dbo.bspGetAccountingExtract finds the record
             # regardless of fee sign (Revenue vs Credit).
-            explicit_extract_type = _get_case_insensitive(
-                parameters, "extractType", "extract_type"
-            )
             raw_targeted: list[dict[str, Any]] = []
             try:
                 raw_targeted = client.get_pending_supplypro_orders(
@@ -1442,6 +1688,8 @@ def run_supplypro_sync(
                 )
                 inspection_id = expected_record.get("inspectionId")
                 expected_fee = expected_record.get("fee")
+                item_user_note = expected_record.get("userNote") or active_user_note
+                item_extract_type = expected_record.get("extractType") or parsed_params.extract_type
 
                 # Check before navigating whether SupplyPro redirected back to login.asp
                 if hasattr(driver, "ensure_authenticated") and callable(driver.ensure_authenticated):
@@ -1474,8 +1722,8 @@ def run_supplypro_sync(
                         "telemetry": telemetry,
                         "prompt_instructions": parsed_params.prompt_instructions,
                     }
-                    if active_user_note:
-                        audit_kwargs["user_note"] = active_user_note
+                    if item_user_note:
+                        audit_kwargs["user_note"] = item_user_note
 
                     audit_verdict = audit_order_with_gemini(**audit_kwargs)
                 except Exception as po_err:
@@ -1489,7 +1737,7 @@ def run_supplypro_sync(
                                 client.log_supplypro_reconciliation({
                                     "executionId": active_execution_id,
                                     "inspectionId": inspection_id,
-                                    "extractType": parsed_params.extract_type,
+                                    "extractType": item_extract_type,
                                     "poNumber": target_po,
                                     "invoiceNumber": str(invoice_num) if invoice_num else None,
                                     "status": "NotFound",
@@ -1535,7 +1783,7 @@ def run_supplypro_sync(
                             client.log_supplypro_reconciliation({
                                 "executionId": active_execution_id,
                                 "inspectionId": inspection_id,
-                                "extractType": parsed_params.extract_type,
+                                "extractType": item_extract_type,
                                 "poNumber": target_po,
                                 "invoiceNumber": str(invoice_num) if invoice_num else None,
                                 "status": "FlaggedForReview",
@@ -1656,7 +1904,7 @@ def run_supplypro_sync(
                     client.log_supplypro_reconciliation({
                         "executionId": active_execution_id,
                         "inspectionId": inspection_id,
-                        "extractType": parsed_params.extract_type,
+                        "extractType": item_extract_type,
                         "poNumber": target_po,
                         "invoiceNumber": str(invoice_num) if invoice_num else None,
                         "status": reconcile_status,
