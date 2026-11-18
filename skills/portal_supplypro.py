@@ -771,6 +771,7 @@ class SupplyProPortalDriver:
             "taskDescription": extracted_fields.get("description", ""),
             "amount": numeric_amount if numeric_amount is not None else amount_str,
             "amountText": amount_str,
+            "orderStatus": extracted_fields.get("status", ""),
             "rawPageText": raw_text[:12000],
         }
         return scraped_payload
@@ -783,7 +784,7 @@ class SupplyProPortalDriver:
 
     @staticmethod
     def _extract_labeled_fields(raw_text: str, po_number: str) -> dict[str, str]:
-        """Extracts Builder, Address, Task Description, and Total Amount from SupplyPro OrderDetail.asp text."""
+        """Extracts Builder, Address, Task Description, Total Amount, and Order Status from SupplyPro OrderDetail.asp text."""
         def _match_line(patterns: list[str]) -> str:
             for pat in patterns:
                 match = re.search(pat, raw_text, flags=re.IGNORECASE | re.MULTILINE)
@@ -815,28 +816,146 @@ class SupplyProPortalDriver:
             r"(\$\s*\d[\d,]*\.\d{2})",
         ])
 
+        status = _match_line([
+            r"(?:Order\s*Status|Status)\s*[:\-]?\s*(Complete(?:d)?|Open|Pending|Accepted|Received|Approved|Cancelled|In\s*Progress)\b",
+            r"(?:Order\s*Status|Status)\s*[:\-]\s*([^\n\r\t]+)",
+        ])
+
         return {
             "poNumber": po_number,
             "builder": builder,
             "address": address,
             "description": description,
             "amount": amount,
+            "status": status,
         }
 
-    def complete_order_on_portal(self, invoice_number: str) -> None:
+    def _find_complete_order_select(self, target, timeout: int = 5000):
+        """
+        Locates the `<select>` dropdown whose initial value is '-- Select Action --'
+        and that contains an `<option>` for 'Complete Order'.
+        """
+        contexts = [target]
+        if self._page and target is self._page:
+            for frame in self._page.frames:
+                if frame is not self._page.main_frame:
+                    contexts.append(frame)
+
+        # 1. Filter <select> elements containing an <option> with text 'Complete Order' or '-- Select Action --'
+        for ctx in contexts:
+            try:
+                filtered = ctx.locator("select").filter(
+                    has=ctx.locator("option", has_text="Complete Order")
+                ).first
+                if filtered.is_visible():
+                    return filtered
+            except Exception:
+                pass
+            try:
+                filtered_default = ctx.locator("select").filter(
+                    has=ctx.locator("option", has_text="Select Action")
+                ).first
+                if filtered_default.is_visible():
+                    return filtered_default
+            except Exception:
+                pass
+
+        # 2. Fallback to explicit CSS/Playwright selectors with wait timeout
+        select_selectors = [
+            "select[name='execute_actions']",
+            "select:has(option:has-text('Complete Order'))",
+            "select:has(option:has-text('-- Select Action --'))",
+            "select[name*='action' i]",
+            "select[id*='action' i]",
+        ]
+        loc = self._find_visible_locator(target, select_selectors, timeout=timeout)
+        if loc is not None:
+            return loc
+
+        # 3. Re-check filtered locator after wait
+        for ctx in contexts:
+            try:
+                filtered = ctx.locator("select").filter(
+                    has=ctx.locator("option", has_text="Complete Order")
+                ).first
+                if filtered.is_visible():
+                    return filtered
+            except Exception:
+                continue
+        return None
+
+    def _is_order_already_complete(self, target, action_select_present: bool = False) -> bool:
+        """
+        Determines whether the SupplyPro Order Details page indicates the order is
+        already Complete (and the action `<select>` dropdown has disappeared).
+        """
+        if action_select_present:
+            return False
+
+        raw_text = ""
+        try:
+            raw_text = target.locator("body").inner_text(timeout=3000) or ""
+        except Exception:
+            if self._page:
+                try:
+                    raw_text = self._page.locator("body").inner_text(timeout=3000) or ""
+                except Exception:
+                    raw_text = ""
+
+        status_patterns = [
+            r"(?:Order\s*Status|Status)\s*[:\-]?\s*Complete(?:d)?\b",
+            r"\bStatus\b[\s\t:\-]*Complete(?:d)?\b",
+            r"\bOrder\s+Complete(?:d)?\b",
+            r"\bCompleted\s+Date\b",
+            r"\bDate\s+Completed\b",
+        ]
+        for pat in status_patterns:
+            if re.search(pat, raw_text, flags=re.IGNORECASE):
+                return True
+
+        # On OrderDetail.asp, if the action <select> dropdown has disappeared and
+        # 'Complete' / 'Completed' appears in the order detail text, treat as Already Complete
+        current_url = (self._page.url if self._page else "") or ""
+        if "orderdetail.asp" in current_url.lower() and re.search(r"\bComplete(?:d)?\b", raw_text, flags=re.IGNORECASE):
+            return True
+
+        return False
+
+    @staticmethod
+    def _select_complete_order_option(action_select) -> None:
+        """Selects the 'Complete Order' option in the action `<select>` matching its exact option label."""
+        matched_label = "Complete Order"
+        try:
+            option_texts = action_select.locator("option").all_inner_texts()
+            for opt_text in option_texts:
+                if "complete order" in opt_text.strip().lower():
+                    matched_label = opt_text.strip()
+                    break
+        except Exception:
+            pass
+        action_select.select_option(label=matched_label)
+
+    def complete_order_on_portal(self, invoice_number: str) -> str:
         """
         When dry_run=False and overallMatch=True on SupplyPro OrderDetail.asp:
-          1. Enters the Burgess invoice number into 'Supplier's Order Number' (`input[name='order_num']`)
-             and clicks 'Update Supplier Info' (`input[name='cmdSubmit2']`) if needed.
-          2. Selects 'Complete Order' in `<select name='execute_actions'>` (or checks a Complete Order checkbox).
-          3. Clicks 'Update' (`input[type='button'][value='Update']`).
+          1. Checks whether the order is already marked Complete (action dropdown absent
+             and order status is Complete/Completed); if so, logs and returns 'Already Complete'.
+          2. Enters the Burgess invoice number into 'Supplier's Order Number' (`input[name='order_num']`)
+             and clicks 'Update Supplier Info' (`input[name='cmdSubmit2']`) if present.
+          3. Locates the `<select>` dropdown (`-- Select Action --` / `Complete Order`),
+             selects 'Complete Order' via `select_option(label=...)`, and clicks 'Update'.
         """
         if self.dry_run:
             logger.info("[DRY-RUN] Safety guardrail active: skipping 'Complete Order' and 'Update'.")
-            return
+            return "DryRun"
 
         target = self._active_target()
-        logger.info("Populating Supplier's Order Number with %r...", invoice_number)
+
+        # Check upfront if the action dropdown is absent and the order is already Complete
+        initial_select = self._find_complete_order_select(target, timeout=2000)
+        if initial_select is None and self._is_order_already_complete(target, action_select_present=False):
+            logger.info("Order is already Complete in SupplyPro — skipping")
+            return "Already Complete"
 
         supplier_order_selectors = [
             "input[name='order_num']",
@@ -847,7 +966,8 @@ class SupplyProPortalDriver:
             "input[name*='invoice' i]",
         ]
         if invoice_number:
-            if self._fill_first_matching(target, supplier_order_selectors, str(invoice_number), timeout=8000):
+            logger.info("Populating Supplier's Order Number with %r...", invoice_number)
+            if self._fill_first_matching(target, supplier_order_selectors, str(invoice_number), timeout=4000):
                 update_sup_btn = self._find_visible_locator(
                     target,
                     ["input[name='cmdSubmit2']", "input[value*='Update Supplier Info']"],
@@ -859,9 +979,9 @@ class SupplyProPortalDriver:
                     target = self._active_target()
 
         action_selected = False
-        action_select = self._find_visible_locator(target, ["select[name='execute_actions']"], timeout=5000)
+        action_select = self._find_complete_order_select(target, timeout=5000)
         if action_select is not None:
-            action_select.select_option(label="Complete Order")
+            self._select_complete_order_option(action_select)
             action_selected = True
         else:
             complete_checkbox_selectors = [
@@ -869,27 +989,46 @@ class SupplyProPortalDriver:
                 "input[type='checkbox'][id*='complete' i]",
                 "input[type='checkbox'][value*='complete' i]",
             ]
-            checkbox = self._find_visible_locator(target, complete_checkbox_selectors, timeout=3000)
+            checkbox = self._find_visible_locator(target, complete_checkbox_selectors, timeout=2000)
             if checkbox is not None:
                 checkbox.check(timeout=5000)
                 action_selected = True
 
         if not action_selected:
+            if self._is_order_already_complete(target, action_select_present=False):
+                logger.info("Order is already Complete in SupplyPro — skipping")
+                return "Already Complete"
             raise RuntimeError("Could not locate 'Complete Order' action selector on Order Details page.")
 
         update_btn_selectors = [
             "input[type='button'][value='Update']",
             "input[type='submit'][value='Update']",
+            "input[value='Update' i]",
             "button:has-text('Update')",
             "a:has-text('Update')",
         ]
         logger.info("Clicking 'Update' to complete the order on SupplyPro...")
+
+        def _accept_dialog(dialog) -> None:
+            try:
+                logger.info("Accepting SupplyPro browser confirmation dialog: %s", dialog.message)
+                dialog.accept()
+            except Exception:
+                pass
+
+        if self._page is not None:
+            try:
+                self._page.once("dialog", _accept_dialog)
+            except Exception:
+                pass
+
         if not self._click_first_matching(target, update_btn_selectors, timeout=8000):
             raise RuntimeError("Could not locate 'Update' button on Order Details page.")
 
         self._page.wait_for_load_state("domcontentloaded", timeout=30000)
         self._click_first_matching(target, ["button#modalOkButton", "button:has-text('OK')"], timeout=3000)
         logger.info("Order successfully marked as Completed and updated on SupplyPro.")
+        return "Completed"
 
     def teardown_browser(self) -> None:
         """Signs out of SupplyPro (to avoid dangling session locks) and closes Playwright resources."""
@@ -1447,24 +1586,46 @@ def run_supplypro_sync(
                 if audit_verdict.overallMatch:
                     reconcile_status = "Reconciled"
                     row_status = "Reconciled (Dry-Run)" if dry_run else "Reconciled"
+                    portal_action_result = "DryRun"
                     if not dry_run:
-                        driver.complete_order_on_portal(invoice_number=str(invoice_num or target_po))
+                        portal_action_result = driver.complete_order_on_portal(
+                            invoice_number=str(invoice_num or target_po)
+                        )
                     processed_count += 1
-                    order_summaries.append(
-                        f"PO {target_po}: MATCH (Invoice={invoice_num or 'N/A'}, Confidence={audit_verdict.confidenceScore:.2f})"
-                    )
                     fee_display = (
                         f"${scraped_amt_float:.2f}"
                         if scraped_amt_float is not None
                         else (f"${float(expected_fee):.2f}" if expected_fee is not None else "N/A")
                     )
-                    progress_logger.info(
-                        "[%d/%d] PO %s -> Reconciled (%s)",
-                        idx,
-                        total_orders,
-                        target_po,
-                        fee_display,
-                    )
+                    if portal_action_result == "Already Complete":
+                        row_status = "Already Complete"
+                        if "already complete" not in (audit_verdict.auditNotes or "").lower():
+                            audit_verdict.auditNotes = (
+                                f"Already Complete | {audit_verdict.auditNotes}"
+                                if audit_verdict.auditNotes
+                                else "Already Complete"
+                            )
+                        order_summaries.append(
+                            f"PO {target_po}: ALREADY COMPLETE (Invoice={invoice_num or 'N/A'}, Confidence={audit_verdict.confidenceScore:.2f})"
+                        )
+                        progress_logger.info(
+                            "[%d/%d] PO %s -> Already Complete (%s)",
+                            idx,
+                            total_orders,
+                            target_po,
+                            fee_display,
+                        )
+                    else:
+                        order_summaries.append(
+                            f"PO {target_po}: MATCH (Invoice={invoice_num or 'N/A'}, Confidence={audit_verdict.confidenceScore:.2f})"
+                        )
+                        progress_logger.info(
+                            "[%d/%d] PO %s -> Reconciled (%s)",
+                            idx,
+                            total_orders,
+                            target_po,
+                            fee_display,
+                        )
                 else:
                     reconcile_status = "FlaggedForReview"
                     row_status = "FlaggedForReview (Dry-Run)" if dry_run else "FlaggedForReview"
