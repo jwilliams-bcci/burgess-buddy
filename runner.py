@@ -29,6 +29,7 @@ from dotenv import load_dotenv
 from core.api_client import BurgessApiClient, BurgessApiError
 from skills.emailer import send_reconciliation_report
 from skills.portal_supplypro import SkillExecutionResult, run_supplypro_sync
+from utils.cost_tracker import CostTracker, DEFAULT_GEMINI_MODEL
 
 load_dotenv(override=True)
 
@@ -356,11 +357,12 @@ def _invoke_skill_handler(
     execution_id: Optional[int] = None,
     posted_date: Optional[str] = None,
     api_client: Optional[BurgessApiClient] = None,
+    cost_tracker: Optional[CostTracker] = None,
 ) -> SkillExecutionResult:
     """
     Invokes the resolved skill handler, passing optional context arguments
     (`po`, `invoice_number`, `user_note`, `prompt_instructions`, `execution_id`,
-    `posted_date`, `api_client`) when accepted by the handler's function signature.
+    `posted_date`, `api_client`, `cost_tracker`) when accepted by the handler's function signature.
     """
     sig = inspect.signature(handler)
     kwargs: dict[str, Any] = {}
@@ -372,6 +374,7 @@ def _invoke_skill_handler(
         "execution_id": execution_id,
         "posted_date": posted_date,
         "api_client": api_client,
+        "cost_tracker": cost_tracker,
     }
     for param_name, param_val in optional_args.items():
         if param_name in sig.parameters:
@@ -429,6 +432,7 @@ def execute_job(
     client = api_client or BurgessApiClient()
     active_execution_id: Optional[int] = int(execution_id) if execution_id is not None else None
     log_streamer: Optional[BufferedExecutionLogHandler] = None
+    cost_tracker = CostTracker(model_name=os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL))
 
     try:
         # Step a: Fetch job details and verify governance state
@@ -586,6 +590,15 @@ def execute_job(
             )
             allowed_skills = parse_allowed_skills(raw_skills)
 
+            resolved_model_name = (
+                _clean_optional_str(_get_field(run_params, "modelName", "model_name", "model", "geminiModel"))
+                or _clean_optional_str(_get_field(site_params, "modelName", "model_name", "model", "geminiModel"))
+                or _clean_optional_str(_get_field(parameters, "modelName", "model_name", "model", "geminiModel"))
+            )
+            if resolved_model_name:
+                cost_tracker.model_name = resolved_model_name
+                parameters["modelName"] = resolved_model_name
+
             handler = resolve_skill_handler(job, parameters, allowed_skills)
             result = _invoke_skill_handler(
                 handler,
@@ -599,7 +612,19 @@ def execute_job(
                 execution_id=active_execution_id,
                 posted_date=resolved_posted_date,
                 api_client=client,
+                cost_tracker=cost_tracker,
             )
+
+            # Sync cost_tracker if a custom skill handler populated result.telemetry directly
+            if (
+                cost_tracker.total_input_tokens == 0
+                and cost_tracker.total_output_tokens == 0
+                and hasattr(result, "telemetry")
+                and result.telemetry is not None
+            ):
+                cost_tracker.total_input_tokens = int(getattr(result.telemetry, "input_tokens", 0) or 0)
+                cost_tracker.total_output_tokens = int(getattr(result.telemetry, "output_tokens", 0) or 0)
+                cost_tracker.total_cost = float(getattr(result.telemetry, "estimated_cost_usd", 0.0) or 0.0)
 
             # Step d.2: Trigger Emailer skill when 'Emailer' is in allowedSkills or recipientEmail is set
             if _should_trigger_emailer(parameters, allowed_skills):
@@ -622,9 +647,10 @@ def execute_job(
                     )
 
             progress_logger.info(
-                "Completed execution (processed=%d, failed=%d)",
+                "Execution complete (processed=%d, failed=%d, cost=$%.4f)",
                 result.records_processed,
                 result.records_failed,
+                cost_tracker.total_cost,
             )
             if log_streamer is not None:
                 log_streamer.flush_to_api()
@@ -638,12 +664,18 @@ def execute_job(
                 failed=result.records_failed,
                 summary=result.output_summary,
                 error=result.error_message,
+                estimated_cost=round(cost_tracker.total_cost, 6),
+                input_tokens=cost_tracker.total_input_tokens,
+                output_tokens=cost_tracker.total_output_tokens,
             )
             logger.info(
-                "Job %s (executionId=%s) finished with status=%s.",
+                "Job %s (executionId=%s) finished with status=%s (processed=%d, failed=%d, cost=$%.4f).",
                 job_id,
                 active_execution_id,
                 result.status,
+                result.records_processed,
+                result.records_failed,
+                cost_tracker.total_cost,
             )
             return 0
 
@@ -654,7 +686,12 @@ def execute_job(
                 active_execution_id,
                 exec_err,
             )
-            progress_logger.info("Execution failed: %s: %s", type(exec_err).__name__, exec_err)
+            progress_logger.info(
+                "Execution failed: %s: %s (cost=$%.4f)",
+                type(exec_err).__name__,
+                exec_err,
+                cost_tracker.total_cost,
+            )
             if log_streamer is not None:
                 log_streamer.flush_to_api()
             # Step e (Failure): Guarantee completion callback is called with status='Failed'
@@ -672,6 +709,9 @@ def execute_job(
                     failed=1 if is_single_item else 0,
                     summary="Execution terminated due to an unhandled runtime error.",
                     error=f"{type(exec_err).__name__}: {exec_err}",
+                    estimated_cost=round(cost_tracker.total_cost, 6),
+                    input_tokens=cost_tracker.total_input_tokens,
+                    output_tokens=cost_tracker.total_output_tokens,
                 )
             except Exception as callback_err:
                 logger.error(

@@ -356,11 +356,17 @@ class BurgessApiClient:
         failed: int = 0,
         summary: str = "",
         error: Optional[str] = None,
+        estimated_cost: float = 0.0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
     ) -> dict[str, Any]:
         """
         Reports execution completion metrics and status back to BurgessApi.
         Endpoint: POST /api/agent/jobs/{jobId}/executions/{executionId}/complete
-        Body: { status, recordsProcessed, recordsFailed, outputSummary, errorMessage }
+        Body: {
+            status, recordsProcessed, recordsFailed, outputSummary, errorMessage,
+            estimatedCost, inputTokens, outputTokens
+        }
         """
         payload = {
             "status": status,
@@ -368,14 +374,20 @@ class BurgessApiClient:
             "recordsFailed": int(failed),
             "outputSummary": summary or "",
             "errorMessage": error,
+            "estimatedCost": round(float(estimated_cost or 0.0), 6),
+            "inputTokens": int(input_tokens or 0),
+            "outputTokens": int(output_tokens or 0),
         }
         logger.info(
-            "Completing execution_id=%s for job_id=%s with status=%s (processed=%s, failed=%s)",
+            "Completing execution_id=%s for job_id=%s with status=%s (processed=%s, failed=%s, cost=$%.4f, inputTokens=%s, outputTokens=%s)",
             execution_id,
             job_id,
             status,
             processed,
             failed,
+            payload["estimatedCost"],
+            payload["inputTokens"],
+            payload["outputTokens"],
         )
         result = self._request(
             "POST",
@@ -383,6 +395,8 @@ class BurgessApiClient:
             json_data=payload,
         )
         return result if isinstance(result, dict) else {"result": result}
+
+    complete_execution = complete_run
 
     def get_execution(self, execution_id: int) -> dict[str, Any]:
         """

@@ -5,6 +5,7 @@ processing via BurgessApi, and token/cost telemetry.
 """
 
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import inspect
 import json
 import logging
 import os
@@ -24,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import URL, create_engine, text
 
 from core.api_client import BurgessApiClient
+from utils.cost_tracker import CostTracker, DEFAULT_GEMINI_MODEL
 
 load_dotenv(override=True)
 
@@ -314,6 +316,10 @@ def unpack_skill_parameters(raw_parameters: Any) -> dict[str, Any]:
     if marked:
         merged["items"] = marked
 
+    model_val = _get_case_insensitive(merged, "modelName", "model_name", "model", "geminiModel")
+    if model_val is not None and str(model_val).strip():
+        merged["modelName"] = str(model_val).strip()
+
     return merged
 
 
@@ -323,6 +329,7 @@ class SupplyProParameters(BaseModel):
     model_config = ConfigDict(extra="allow", populate_by_name=True)
 
     target_portal: str = Field(default="SupplyPro", alias="targetPortal")
+    model_name: str = Field(default=DEFAULT_GEMINI_MODEL, alias="modelName")
     extract_type: str = Field(default="Revenue", alias="extractType")
     batch_limit: int = Field(default=50, alias="batchLimit", ge=1)
     posted_date: Optional[str] = Field(default=None, alias="postedDate")
@@ -372,20 +379,43 @@ class TokenTelemetry(BaseModel):
     """Accumulated Gemini token usage and estimated USD cost across a job execution."""
 
     input_tokens: int = 0
+    cached_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
     estimated_cost_usd: float = 0.0
 
-    def add_usage(self, prompt_tokens: int, candidate_tokens: int, total_tokens: int = 0) -> None:
-        self.input_tokens += int(prompt_tokens or 0)
-        self.output_tokens += int(candidate_tokens or 0)
-        computed_total = int(total_tokens) if total_tokens else (int(prompt_tokens or 0) + int(candidate_tokens or 0))
+    def add_usage(
+        self,
+        prompt_tokens: int,
+        candidate_tokens: int,
+        total_tokens: int = 0,
+        cached_tokens: int = 0,
+        call_cost: Optional[float] = None,
+    ) -> None:
+        p_tok = int(prompt_tokens or 0)
+        c_tok = int(candidate_tokens or 0)
+        cache_tok = int(cached_tokens or 0)
+        self.input_tokens += p_tok
+        self.cached_tokens += cache_tok
+        self.output_tokens += c_tok
+        computed_total = int(total_tokens) if total_tokens else (p_tok + c_tok)
         self.total_tokens += computed_total
-        self.estimated_cost_usd = round(
-            (self.input_tokens * GEMINI_25_FLASH_INPUT_COST_PER_1M / 1_000_000)
-            + (self.output_tokens * GEMINI_25_FLASH_OUTPUT_COST_PER_1M / 1_000_000),
-            6,
-        )
+        if call_cost is not None:
+            self.estimated_cost_usd = round(self.estimated_cost_usd + float(call_cost), 6)
+        else:
+            self.estimated_cost_usd = round(
+                (self.input_tokens * GEMINI_25_FLASH_INPUT_COST_PER_1M / 1_000_000)
+                + (self.output_tokens * GEMINI_25_FLASH_OUTPUT_COST_PER_1M / 1_000_000),
+                6,
+            )
+
+    def sync_from_cost_tracker(self, tracker: CostTracker) -> None:
+        """Synchronizes cumulative token and cost counts from a CostTracker instance."""
+        self.input_tokens = int(tracker.total_input_tokens)
+        self.cached_tokens = int(tracker.total_cached_tokens)
+        self.output_tokens = int(tracker.total_output_tokens)
+        self.total_tokens = int(tracker.total_input_tokens + tracker.total_output_tokens)
+        self.estimated_cost_usd = round(float(tracker.total_cost), 6)
 
 
 class SkillExecutionResult(BaseModel):
@@ -1239,12 +1269,15 @@ def audit_order_with_gemini(
     telemetry: Optional[TokenTelemetry] = None,
     prompt_instructions: Optional[str] = None,
     user_note: Optional[str] = None,
+    cost_tracker: Optional[CostTracker] = None,
+    model_name: str = DEFAULT_GEMINI_MODEL,
 ) -> SupplyProAuditResult:
     """
     Performs a 4-factor semantic comparison between the internal Burgess record (`expected`)
-    and the scraped SupplyPro order (`scraped`) using Gemini 2.5 Flash, while accumulating
-    token usage and cost telemetry.
+    and the scraped SupplyPro order (`scraped`) using Gemini, while accumulating
+    token usage and cost telemetry via `CostTracker` and `TokenTelemetry`.
     """
+    active_model = (model_name or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE").strip().upper() == "TRUE"
     client = genai.Client(
         vertexai=use_vertex,
@@ -1300,7 +1333,7 @@ Evaluate `builderMatch`, `addressMatch`, `inspectionTypeMatch`, `feeMatch`, `ove
     system_instruction = _build_audit_system_instruction(prompt_instructions)
 
     response = client.models.generate_content(
-        model="gemini-3.5-flash-lite",
+        model=active_model,
         contents=prompt,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
@@ -1310,20 +1343,52 @@ Evaluate `builderMatch`, `addressMatch`, `inspectionTypeMatch`, `feeMatch`, `ove
         ),
     )
 
-    usage = getattr(response, "usage_metadata", None)
-    if usage is not None and telemetry is not None:
-        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0)
-        candidate_tokens = int(getattr(usage, "candidates_token_count", 0) or 0)
-        total_tokens = int(getattr(usage, "total_token_count", 0) or (prompt_tokens + candidate_tokens))
-        telemetry.add_usage(prompt_tokens, candidate_tokens, total_tokens)
+    if cost_tracker is not None:
+        call_cost = cost_tracker.record_usage(response, model_name=active_model)
+        if telemetry is not None:
+            telemetry.sync_from_cost_tracker(cost_tracker)
+        usage = getattr(response, "usage_metadata", None)
+        prompt_tokens = int(getattr(usage, "prompt_token_count", 0) or 0) if usage else 0
+        output_tokens = (
+            int(getattr(usage, "candidates_token_count", 0) or 0)
+            + int(getattr(usage, "thoughts_token_count", 0) or 0)
+            if usage
+            else 0
+        )
         logger.info(
-            "Gemini 3.5 Flash usage for PO %s: input=%d, output=%d, total=%d (cumulative cost=$%.6f)",
+            "Gemini (%s) usage for PO %s: input=%d, output=%d, call_cost=$%.6f (cumulative cost=$%.6f)",
+            active_model,
             po_label,
             prompt_tokens,
-            candidate_tokens,
-            total_tokens,
-            telemetry.estimated_cost_usd,
+            output_tokens,
+            call_cost,
+            cost_tracker.total_cost,
         )
+    else:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is not None and telemetry is not None:
+            temp_tracker = CostTracker(model_name=active_model)
+            call_cost = temp_tracker.record_usage(response, model_name=active_model)
+            prompt_tokens = temp_tracker.total_input_tokens
+            output_tokens = temp_tracker.total_output_tokens
+            cached_tokens = temp_tracker.total_cached_tokens
+            total_tokens = int(getattr(usage, "total_token_count", 0) or (prompt_tokens + output_tokens))
+            telemetry.add_usage(
+                prompt_tokens,
+                output_tokens,
+                total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
+                call_cost=call_cost,
+            )
+            logger.info(
+                "Gemini (%s) usage for PO %s: input=%d, output=%d, total=%d (cumulative cost=$%.6f)",
+                active_model,
+                po_label,
+                prompt_tokens,
+                output_tokens,
+                total_tokens,
+                telemetry.estimated_cost_usd,
+            )
 
     if response.parsed and isinstance(response.parsed, SupplyProAuditResult):
         verdict = response.parsed
@@ -1519,6 +1584,7 @@ def run_supplypro_sync(
     execution_id: Optional[int] = None,
     posted_date: Optional[str] = None,
     api_client: Optional[BurgessApiClient] = None,
+    cost_tracker: Optional[CostTracker] = None,
 ) -> SkillExecutionResult:
     """
     Entry point for the SupplyPro PortalSync skill.
@@ -1665,6 +1731,7 @@ def run_supplypro_sync(
             )
 
         driver = SupplyProPortalDriver(params=parsed_params, dry_run=dry_run)
+        active_cost_tracker = cost_tracker if cost_tracker is not None else CostTracker(model_name=parsed_params.model_name)
         telemetry = TokenTelemetry()
         details_list: list[dict[str, Any]] = []
         processed_count = 0
@@ -1724,8 +1791,19 @@ def run_supplypro_sync(
                     }
                     if item_user_note:
                         audit_kwargs["user_note"] = item_user_note
+                    if "cost_tracker" in inspect.signature(audit_order_with_gemini).parameters:
+                        audit_kwargs["cost_tracker"] = active_cost_tracker
+                    if "model_name" in inspect.signature(audit_order_with_gemini).parameters and parsed_params.model_name != DEFAULT_GEMINI_MODEL:
+                        audit_kwargs["model_name"] = parsed_params.model_name
 
                     audit_verdict = audit_order_with_gemini(**audit_kwargs)
+                    if telemetry.input_tokens == 0 and active_cost_tracker.total_input_tokens > 0:
+                        telemetry.sync_from_cost_tracker(active_cost_tracker)
+                    elif telemetry.input_tokens > 0 and active_cost_tracker.total_input_tokens == 0:
+                        # Support unit tests that mock audit_order_with_gemini and mutate `telemetry` directly
+                        active_cost_tracker.total_input_tokens = telemetry.input_tokens
+                        active_cost_tracker.total_output_tokens = telemetry.output_tokens
+                        active_cost_tracker.total_cost = telemetry.estimated_cost_usd
                 except Exception as po_err:
                     if _is_not_found_error(po_err):
                         not_found_note = "PO not found in SupplyPro portal"
