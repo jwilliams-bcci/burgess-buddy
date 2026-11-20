@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import URL, create_engine, text
 
 from core.api_client import BurgessApiClient
+from po_normalizer import NormalizedPOLookup, normalize_and_split_po
 from utils.cost_tracker import CostTracker, DEFAULT_GEMINI_MODEL
 
 load_dotenv(override=True)
@@ -39,6 +40,10 @@ class SupplyProOrderNotFoundError(RuntimeError):
 
 class SupplyProSessionExpiredError(RuntimeError):
     """Raised when SupplyPro redirects an active session back to login.asp."""
+
+
+class SupplyProCsrBlockedError(RuntimeError):
+    """Raised when an open SupplyPro order has its 'Complete Order' action missing or disabled."""
 
 # Gemini 2.5 Flash standard pricing (USD per 1M tokens)
 GEMINI_25_FLASH_INPUT_COST_PER_1M = 0.30
@@ -210,7 +215,24 @@ def extract_marked_items(params: dict[str, Any]) -> list[dict[str, Any]]:
                 if ext_v is not None and str(ext_v).strip():
                     extra_fields["extractType"] = str(ext_v).strip()
                 # Preserve any inline expected fields if supplied on the item object
-                for field_name in ("builderName", "BuilderName", "propertyAddress", "PropertyAddress", "inspectionType", "InspectionType", "fee", "Fee", "inspectionId", "InspectionID"):
+                for field_name in (
+                    "builderName",
+                    "BuilderName",
+                    "propertyAddress",
+                    "PropertyAddress",
+                    "inspectionType",
+                    "InspectionType",
+                    "TypeName",
+                    "typeName",
+                    "fee",
+                    "Fee",
+                    "inspectionId",
+                    "InspectionID",
+                    "reinspect",
+                    "Reinspect",
+                    "is_reinspect",
+                    "isReinspect",
+                ):
                     if field_name in elem and elem[field_name] is not None:
                         extra_fields[field_name] = elem[field_name]
                 _add_entry(po_v, inv_v, extra=extra_fields)
@@ -423,6 +445,7 @@ class SkillExecutionResult(BaseModel):
 
     status: str = "Completed"
     records_processed: int = 0
+    records_exception: int = 0
     records_failed: int = 0
     output_summary: str = ""
     error_message: Optional[str] = None
@@ -430,13 +453,45 @@ class SkillExecutionResult(BaseModel):
     telemetry: TokenTelemetry = Field(default_factory=TokenTelemetry)
 
 
+def _extract_reinspect_bool(row: dict[str, Any]) -> bool:
+    """
+    Safely extracts the `Reinspect` bit column (`bool(row.get("Reinspect"))`)
+    from an `ai.vw_AccountingExtract` row or API DTO.
+    """
+    if not isinstance(row, dict):
+        return False
+    if "Reinspect" in row and row["Reinspect"] is not None:
+        coerced = _coerce_optional_bool(row["Reinspect"])
+        return bool(coerced) if coerced is not None else bool(row.get("Reinspect"))
+    raw_val = _get_case_insensitive(
+        row,
+        "Reinspect",
+        "reinspect",
+        "isReinspect",
+        "is_reinspect",
+        "IsReinspect",
+    )
+    if raw_val is None:
+        return False
+    coerced = _coerce_optional_bool(raw_val)
+    return bool(coerced) if coerced is not None else bool(raw_val)
+
+
 def normalize_pending_order_record(raw_order: dict[str, Any]) -> dict[str, Any]:
     """
     Normalizes a pending order record returned by `GET /api/accounting/supplypro/pending`
-    into the standard `expected` dictionary structure required by the 4-factor auditor.
+    or `ai.vw_AccountingExtract` into the standard `expected` dictionary structure.
     """
     po_num = str(
-        _get_case_insensitive(raw_order, "poNumber", "PONumber", "po", "builderOrderNumber", default="")
+        _get_case_insensitive(
+            raw_order,
+            "poNumber",
+            "PONumber",
+            "po",
+            "PurchaseOrderNumber",
+            "builderOrderNumber",
+            default="",
+        )
     ).strip()
     insp_id_raw = _get_case_insensitive(raw_order, "inspectionId", "InspectionID", "id")
     insp_id = int(insp_id_raw) if insp_id_raw is not None and str(insp_id_raw).isdigit() else None
@@ -444,24 +499,50 @@ def normalize_pending_order_record(raw_order: dict[str, Any]) -> dict[str, Any]:
     inv_raw = _get_case_insensitive(raw_order, "invoiceNumber", "InvoiceNumber", "invoice")
     inv_str = str(inv_raw).strip() if inv_raw not in (None, "") else None
 
-    fee_raw = _get_case_insensitive(raw_order, "fee", "Fee", "expectedAmount", "amount")
+    fee_raw = _get_case_insensitive(raw_order, "fee", "Fee", "Amount", "expectedAmount", "amount")
     fee_dec = _to_cents(fee_raw)
     fee_val = float(fee_dec) if fee_dec is not None else None
+    is_reinspect = _extract_reinspect_bool(raw_order)
 
     return {
         "poNumber": po_num,
         "inspectionId": insp_id,
         "invoiceNumber": inv_str,
         "builderName": str(
-            _get_case_insensitive(raw_order, "builderName", "BuilderName", "builder", default="")
+            _get_case_insensitive(
+                raw_order,
+                "builderName",
+                "BuilderName",
+                "ClientName",
+                "clientName",
+                "builder",
+                default="",
+            )
         ).strip(),
         "propertyAddress": str(
-            _get_case_insensitive(raw_order, "propertyAddress", "PropertyAddress", "address", default="")
+            _get_case_insensitive(
+                raw_order,
+                "propertyAddress",
+                "PropertyAddress",
+                "Address",
+                "address",
+                default="",
+            )
         ).strip(),
         "inspectionType": str(
-            _get_case_insensitive(raw_order, "inspectionType", "InspectionType", "task", default="")
+            _get_case_insensitive(
+                raw_order,
+                "inspectionType",
+                "InspectionType",
+                "TypeName",
+                "typeName",
+                "task",
+                default="",
+            )
         ).strip(),
         "fee": fee_val,
+        "reinspect": is_reinspect,
+        "is_reinspect": is_reinspect,
         "dbRecordFound": True,
     }
 
@@ -471,8 +552,9 @@ def fetch_expected_order_from_db(
     fallback_params: Optional[SupplyProParameters] = None,
 ) -> dict[str, Any]:
     """
-    Queries `ai.VW_AccountingExtractRevenue` (or `ai.VW_AccountingExtract_Revenue`)
-    for the target PO's expected internal record values when running in single `--po` mode.
+    Queries `ai.vw_AccountingExtract` (with fallback to `ai.VW_AccountingExtractRevenue` /
+    `ai.VW_AccountingExtract_Revenue`) for the target PO's expected internal record values,
+    including the `Reinspect` bit column (`bool(row.get("Reinspect"))`).
     """
     defaults: dict[str, Any] = {
         "poNumber": po_number,
@@ -482,6 +564,8 @@ def fetch_expected_order_from_db(
         "fee": fallback_params.expected_fee if (fallback_params and fallback_params.expected_fee is not None) else None,
         "invoiceNumber": fallback_params.invoice_number if fallback_params else None,
         "inspectionId": None,
+        "reinspect": False,
+        "is_reinspect": False,
         "dbRecordFound": False,
     }
 
@@ -502,64 +586,114 @@ def fetch_expected_order_from_db(
         database=db_name,
     )
 
-    view_candidates = [
-        "ai.VW_AccountingExtractRevenue",
-        "ai.VW_AccountingExtract_Revenue",
+    view_queries = [
+        (
+            "ai.vw_AccountingExtract",
+            """
+            SELECT TOP 1
+                InspectionID,
+                InvoiceNumber,
+                BuilderName,
+                PONumber,
+                PropertyAddress,
+                InspectionType,
+                Fee,
+                Reinspect
+            FROM ai.vw_AccountingExtract
+            WHERE PONumber = :exact_po OR PONumber LIKE :like_po
+            ORDER BY
+                CASE WHEN PONumber = :exact_po THEN 0 ELSE 1 END,
+                InspectionDate DESC
+            """,
+        ),
+        (
+            "ai.vw_AccountingExtract",
+            """
+            SELECT TOP 1
+                *,
+                Reinspect
+            FROM ai.vw_AccountingExtract
+            WHERE PONumber = :exact_po OR PONumber LIKE :like_po
+            """,
+        ),
+        (
+            "ai.VW_AccountingExtractRevenue",
+            """
+            SELECT TOP 1
+                InspectionID,
+                InvoiceNumber,
+                BuilderName,
+                PONumber,
+                PropertyAddress,
+                InspectionType,
+                Fee
+            FROM ai.VW_AccountingExtractRevenue
+            WHERE PONumber = :exact_po OR PONumber LIKE :like_po
+            ORDER BY
+                CASE WHEN PONumber = :exact_po THEN 0 ELSE 1 END,
+                InspectionDate DESC
+            """,
+        ),
+        (
+            "ai.VW_AccountingExtract_Revenue",
+            """
+            SELECT TOP 1
+                InspectionID,
+                InvoiceNumber,
+                BuilderName,
+                PONumber,
+                PropertyAddress,
+                InspectionType,
+                Fee
+            FROM ai.VW_AccountingExtract_Revenue
+            WHERE PONumber = :exact_po OR PONumber LIKE :like_po
+            ORDER BY
+                CASE WHEN PONumber = :exact_po THEN 0 ELSE 1 END,
+                InspectionDate DESC
+            """,
+        ),
     ]
 
     try:
         engine = create_engine(connection_url)
         with engine.connect() as conn:
-            for view_name in view_candidates:
+            for view_name, sql_text in view_queries:
                 try:
-                    query = text(
-                        f"""
-                        SELECT TOP 1
-                            InspectionID,
-                            InvoiceNumber,
-                            BuilderName,
-                            PONumber,
-                            PropertyAddress,
-                            InspectionType,
-                            Fee
-                        FROM {view_name}
-                        WHERE PONumber = :exact_po OR PONumber LIKE :like_po
-                        ORDER BY
-                            CASE WHEN PONumber = :exact_po THEN 0 ELSE 1 END,
-                            InspectionDate DESC
-                        """
-                    )
-                    row = conn.execute(
-                        query,
+                    row_mapping = conn.execute(
+                        text(sql_text),
                         {"exact_po": po_number, "like_po": f"%{po_number}%"},
                     ).mappings().first()
 
-                    if row:
-                        fee_dec = _to_cents(row.get("Fee"))
+                    if row_mapping:
+                        row = dict(row_mapping)
+                        is_reinspect = bool(row.get("Reinspect")) if "Reinspect" in row else _extract_reinspect_bool(row)
+                        fee_raw = _get_case_insensitive(row, "Fee", "Amount", "fee", "amount")
+                        fee_dec = _to_cents(fee_raw)
                         fee_val = float(fee_dec) if fee_dec is not None else defaults["fee"]
-                        inv_val = (
-                            str(row["InvoiceNumber"]).strip()
-                            if row.get("InvoiceNumber") is not None
-                            else defaults["invoiceNumber"]
-                        )
+                        inv_raw = _get_case_insensitive(row, "InvoiceNumber", "invoiceNumber")
+                        inv_val = str(inv_raw).strip() if inv_raw is not None else defaults["invoiceNumber"]
+                        insp_id_raw = _get_case_insensitive(row, "InspectionID", "inspectionId")
                         record = {
-                            "poNumber": str(row.get("PONumber") or po_number).strip(),
-                            "builderName": str(row.get("BuilderName") or "").strip(),
-                            "propertyAddress": str(row.get("PropertyAddress") or "").strip(),
-                            "inspectionType": str(row.get("InspectionType") or "").strip(),
+                            "poNumber": str(_get_case_insensitive(row, "PONumber", "poNumber", default=po_number)).strip(),
+                            "builderName": str(_get_case_insensitive(row, "BuilderName", "ClientName", default="")).strip(),
+                            "propertyAddress": str(_get_case_insensitive(row, "PropertyAddress", "Address", default="")).strip(),
+                            "inspectionType": str(_get_case_insensitive(row, "InspectionType", "TypeName", default="")).strip(),
                             "fee": fee_val,
                             "invoiceNumber": inv_val,
-                            "inspectionId": int(row["InspectionID"]) if row.get("InspectionID") is not None else None,
+                            "inspectionId": int(insp_id_raw) if insp_id_raw is not None else None,
+                            "reinspect": is_reinspect,
+                            "is_reinspect": is_reinspect,
                             "dbRecordFound": True,
                         }
                         logger.info(
-                            "Loaded expected record from %s for PO %s: builder=%r, address=%r, type=%r, fee=%s, invoice=%s",
+                            "Loaded expected record from %s for PO %s: builder=%r, address=%r, type=%r, fee=%s, reinspect=%s, invoice=%s",
                             view_name,
                             po_number,
                             record["builderName"],
                             record["propertyAddress"],
                             record["inspectionType"],
                             record["fee"],
+                            record["reinspect"],
                             record["invoiceNumber"],
                         )
                         return record
@@ -571,6 +705,263 @@ def fetch_expected_order_from_db(
 
     logger.warning("No database record found for PO %s; using fallback expected values.", po_number)
     return defaults
+
+
+# Default seed mappings from BORE.ai.SupplyProTaskMappings (used as fallback when DB is unreachable)
+DEFAULT_SUPPLYPRO_TASK_MAPPINGS: list[dict[str, Any]] = [
+    {
+        "builderName": "Davidson Homes",
+        "internalInspectionType": "Final",
+        "supplyProTaskName": "Q.I. Reinspect",
+        "isReinspect": True,
+        "isActive": True,
+    },
+    {
+        "builderName": "Davidson Homes",
+        "internalInspectionType": "Final - Davidson Homes-2",
+        "supplyProTaskName": "Q.I. Reinspect",
+        "isReinspect": True,
+        "isActive": True,
+    },
+    {
+        "builderName": None,
+        "internalInspectionType": "Final - Davidson Homes-2",
+        "supplyProTaskName": "Q.I. Reinspect",
+        "isReinspect": True,
+        "isActive": True,
+    },
+]
+
+_REINSPECT_TERM_RE = re.compile(r"\bre[\-\s]*inspect(?:ion)?\b", re.IGNORECASE)
+_FIRST_TIME_TAG_RE = re.compile(
+    r"(?:\(\s*1\s*\)|\bfirst[\-\s]+time\b|(?:^|[\sA-Za-z0-9_])\-1(?:\b|$))",
+    re.IGNORECASE,
+)
+
+
+def is_reinspection_task_name(task_name: Optional[str]) -> bool:
+    """
+    Returns True if `task_name` contains reinspection terminology
+    (`reinspect`, `reinspection`, `re-inspect`, `re-inspection`, case-insensitive).
+    """
+    if not task_name:
+        return False
+    return bool(_REINSPECT_TERM_RE.search(str(task_name)))
+
+
+def has_forbidden_first_time_tag(task_name: Optional[str]) -> bool:
+    """
+    Returns True if `task_name` is tagged with `-1`, `(1)`, or `First-Time` / `First Time`
+    (case-insensitive).
+    """
+    if not task_name:
+        return False
+    return bool(_FIRST_TIME_TAG_RE.search(str(task_name)))
+
+
+def _normalize_mapping_entry(raw_row: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Normalizes a row from `BORE.ai.SupplyProTaskMappings` into a standard dict."""
+    if not isinstance(raw_row, dict):
+        return None
+    is_active_raw = _get_case_insensitive(raw_row, "IsActive", "isActive", "is_active", default=True)
+    coerced_active = _coerce_optional_bool(is_active_raw)
+    if coerced_active is False:
+        return None
+
+    internal_type = str(
+        _get_case_insensitive(
+            raw_row,
+            "InternalInspectionType",
+            "internalInspectionType",
+            "internal_inspection_type",
+            "TypeName",
+            default="",
+        )
+    ).strip()
+    supplypro_task = str(
+        _get_case_insensitive(
+            raw_row,
+            "SupplyProTaskName",
+            "supplyProTaskName",
+            "supplypro_task_name",
+            "ExternalTaskName",
+            "TaskName",
+            default="",
+        )
+    ).strip()
+    if not internal_type or not supplypro_task:
+        return None
+
+    builder_raw = _get_case_insensitive(raw_row, "BuilderName", "builderName", "builder_name")
+    builder_str = str(builder_raw).strip() if builder_raw is not None and str(builder_raw).strip() else None
+
+    reinspect_raw = _get_case_insensitive(raw_row, "IsReinspect", "isReinspect", "is_reinspect", "Reinspect")
+    is_reinspect = _coerce_optional_bool(reinspect_raw) if reinspect_raw is not None else None
+
+    return {
+        "builderName": builder_str,
+        "internalInspectionType": internal_type,
+        "supplyProTaskName": supplypro_task,
+        "isReinspect": is_reinspect,
+        "isActive": True,
+    }
+
+
+def load_supplypro_task_mappings(
+    extra_mappings: Optional[list[dict[str, Any]]] = None,
+) -> list[dict[str, Any]]:
+    """
+    Loads active task mapping rules from `BORE.ai.SupplyProTaskMappings` at the start of a job run,
+    merging any explicit `extra_mappings` and default baseline rules.
+    """
+    loaded: list[dict[str, Any]] = []
+    seen_keys: set[tuple[str, str, str]] = set()
+
+    def _add(entry: Optional[dict[str, Any]]) -> None:
+        if not entry:
+            return
+        key = (
+            (entry.get("builderName") or "").lower(),
+            entry["internalInspectionType"].lower(),
+            entry["supplyProTaskName"].lower(),
+        )
+        if key not in seen_keys:
+            seen_keys.add(key)
+            loaded.append(entry)
+
+    if extra_mappings:
+        for item in extra_mappings:
+            _add(_normalize_mapping_entry(item))
+
+    db_user = os.getenv("DB_USER")
+    db_password = os.getenv("DB_PASSWORD")
+    db_server = os.getenv("DB_SERVER")
+    db_name = os.getenv("DB_NAME")
+
+    if db_user and db_password and db_server and db_name:
+        connection_url = URL.create(
+            "mssql+pymssql",
+            username=db_user,
+            password=db_password,
+            host=db_server,
+            database=db_name,
+        )
+        table_candidates = [
+            "BORE.ai.SupplyProTaskMappings",
+            "ai.SupplyProTaskMappings",
+        ]
+        try:
+            engine = create_engine(connection_url)
+            with engine.connect() as conn:
+                for table_name in table_candidates:
+                    try:
+                        rows = (
+                            conn.execute(
+                                text(f"SELECT * FROM {table_name} WHERE IsActive = 1")
+                            )
+                            .mappings()
+                            .all()
+                        )
+                        for r in rows:
+                            _add(_normalize_mapping_entry(dict(r)))
+                        logger.info(
+                            "Loaded %d active task mapping(s) from %s.",
+                            len(rows),
+                            table_name,
+                        )
+                        break
+                    except Exception as table_err:
+                        logger.debug("Query on %s skipped: %s", table_name, table_err)
+                        continue
+        except Exception as db_err:
+            logger.warning(
+                "Could not query BORE.ai.SupplyProTaskMappings (%s); using built-in mappings.",
+                db_err,
+            )
+
+    for default_item in DEFAULT_SUPPLYPRO_TASK_MAPPINGS:
+        _add(_normalize_mapping_entry(default_item))
+
+    return loaded
+
+
+def _builder_matches_mapping(
+    order_builder: Optional[str],
+    mapping_builder: Optional[str],
+) -> bool:
+    """
+    Returns True if `mapping_builder` matches `order_builder` (case-insensitive exact
+    or corporate/division prefix match, e.g., 'Davidson Homes' vs 'Davidson Homes - Texas').
+    """
+    if not mapping_builder or not order_builder:
+        return False
+    ob = order_builder.strip().lower()
+    mb = mapping_builder.strip().lower()
+    return ob == mb or mb in ob or ob in mb
+
+
+def _strip_po_brackets(task_str: str) -> str:
+    """Strips bracketed PO metadata like `[00081-12488-1050][PO]` while preserving `(1)` or `-1`."""
+    return re.sub(r"\s*\[[^\]]*\]", "", (task_str or "")).strip()
+
+
+def match_sql_task_mapping(
+    internal_inspection_type: str,
+    supplypro_task_name: str,
+    builder_name: Optional[str] = None,
+    task_mappings: Optional[list[dict[str, Any]]] = None,
+    is_reinspect: Optional[bool] = None,
+) -> Optional[dict[str, Any]]:
+    """
+    Checks `BORE.ai.SupplyProTaskMappings` for an active mapping matching
+    `internal_inspection_type` -> `supplypro_task_name`.
+    Evaluates builder-specific mappings (`BuilderName` + `InternalInspectionType`) first,
+    then global (`BuilderName IS NULL`) rules.
+    """
+    mappings = task_mappings if task_mappings is not None else DEFAULT_SUPPLYPRO_TASK_MAPPINGS
+    int_clean = (internal_inspection_type or "").strip().lower()
+    int_base = _strip_po_brackets(internal_inspection_type or "").lower()
+    sp_clean = (supplypro_task_name or "").strip().lower()
+    sp_base = _strip_po_brackets(supplypro_task_name or "").lower()
+
+    if not int_clean or not sp_clean:
+        return None
+
+    builder_specific = [
+        m for m in mappings if m.get("builderName") and _builder_matches_mapping(builder_name, m.get("builderName"))
+    ]
+    global_rules = [m for m in mappings if not m.get("builderName")]
+
+    for tier in (builder_specific, global_rules):
+        for rule in tier:
+            rule_reinspect = rule.get("isReinspect")
+            if is_reinspect is not None and rule_reinspect is not None and bool(rule_reinspect) != bool(is_reinspect):
+                continue
+
+            map_int = (rule.get("internalInspectionType") or "").strip().lower()
+            map_sp = (rule.get("supplyProTaskName") or "").strip().lower()
+            if not map_int or not map_sp:
+                continue
+
+            sp_matched = sp_clean == map_sp or sp_base == map_sp
+            if not sp_matched:
+                continue
+
+            # Direct match on InternalInspectionType
+            if int_clean == map_int or int_base == map_int:
+                return rule
+
+            # Composite Rule 1.3 format: e.g., "Final - Davidson Homes-2" when internal_type="Final",
+            # builder="Davidson Homes", and is_reinspect=True
+            if builder_name and is_reinspect:
+                composite_candidate = f"{int_base} - {builder_name.strip().lower()}-2"
+                if map_int == composite_candidate or (
+                    map_int.startswith(f"{int_base} - ")
+                    and builder_name.strip().lower() in map_int
+                ):
+                    return rule
+
+    return None
 
 
 class SupplyProPortalDriver:
@@ -788,11 +1179,120 @@ class SupplyProPortalDriver:
             return True
         return False
 
-    def search_and_scrape_order(self, po_number: str) -> dict[str, Any]:
+    def _select_best_order_detail_link(
+        self,
+        target,
+        po_number: str,
+        is_reinspect: bool = False,
+        internal_inspection_type: Optional[str] = None,
+    ):
+        """
+        Selects the best OrderDetail.asp link on Order Search results (`orderlist.asp`).
+        When multiple PO rows are returned:
+          - If `is_reinspect` is False: filters out rows with `-1`, `(1)`, `First-Time`,
+            or `Reinspect` tags in favor of the standard `TypeName` (`internal_inspection_type`) row.
+          - If `is_reinspect` is True: prefers rows containing reinspection terminology.
+        """
+        detail_link_selectors = [
+            f"a:has-text('{po_number}')",
+            "a[href*='OrderDetail.asp']",
+            "a[href*='orderdetail.asp']",
+            "a:has-text('Details')",
+        ]
+
+        try:
+            row_locator = target.locator(
+                "tr:has(a[href*='OrderDetail.asp' i]), tr:has(a[href*='orderdetail.asp' i])"
+            )
+            row_count = row_locator.count()
+            if row_count > 1:
+                candidates: list[tuple[str, Any]] = []
+                for i in range(row_count):
+                    row_el = row_locator.nth(i)
+                    try:
+                        if not row_el.is_visible():
+                            continue
+                        row_text = (row_el.inner_text(timeout=1500) or "").strip()
+                        link_el = row_el.locator(
+                            f"a:has-text('{po_number}'), a[href*='OrderDetail.asp' i], a[href*='orderdetail.asp' i]"
+                        ).first
+                        if link_el.is_visible():
+                            candidates.append((row_text, link_el))
+                    except Exception:
+                        continue
+
+                if len(candidates) > 1:
+                    int_type_lower = _strip_po_brackets(internal_inspection_type or "").lower()
+                    if not is_reinspect:
+                        filtered = [
+                            (txt, lnk)
+                            for txt, lnk in candidates
+                            if not is_reinspection_task_name(txt) and not has_forbidden_first_time_tag(txt)
+                        ]
+                        pool = filtered if filtered else candidates
+                        if int_type_lower:
+                            for txt, lnk in pool:
+                                if int_type_lower in txt.lower():
+                                    return lnk
+                        return pool[0][1]
+                    else:
+                        reinspect_rows = [
+                            (txt, lnk)
+                            for txt, lnk in candidates
+                            if is_reinspection_task_name(txt)
+                        ]
+                        if reinspect_rows:
+                            return reinspect_rows[0][1]
+        except Exception as row_filter_err:
+            logger.debug("Multi-row SupplyPro filter fallback on PO %s: %s", po_number, row_filter_err)
+
+        return self._find_visible_locator(target, detail_link_selectors, timeout=12000)
+
+    def _is_complete_order_action_available(self, target) -> bool:
+        """
+        Checks whether the 'Complete Order' action dropdown (or checkbox) is present and enabled
+        on SupplyPro's Order Details page. Returns False when CSR-blocked or unavailable.
+        """
+        action_select = self._find_complete_order_select(target, timeout=1500)
+        if action_select is not None:
+            try:
+                if hasattr(action_select, "is_disabled") and action_select.is_disabled():
+                    return False
+                option_texts = action_select.locator("option").all_inner_texts()
+                if option_texts and not any("complete order" in t.strip().lower() for t in option_texts):
+                    return False
+                complete_opt = action_select.locator("option", has_text="Complete Order").first
+                if hasattr(complete_opt, "is_disabled") and complete_opt.is_disabled():
+                    return False
+                return True
+            except Exception:
+                return True
+
+        complete_checkbox_selectors = [
+            "input[type='checkbox'][name*='complete' i]",
+            "input[type='checkbox'][id*='complete' i]",
+            "input[type='checkbox'][value*='complete' i]",
+        ]
+        checkbox = self._find_visible_locator(target, complete_checkbox_selectors, timeout=500)
+        if checkbox is not None:
+            try:
+                if hasattr(checkbox, "is_disabled") and checkbox.is_disabled():
+                    return False
+            except Exception:
+                pass
+            return True
+        return False
+
+    def search_and_scrape_order(
+        self,
+        po_number: str,
+        is_reinspect: bool = False,
+        internal_inspection_type: Optional[str] = None,
+    ) -> dict[str, Any]:
         """
         Navigates to Order Search (`Orders/orderlist.asp`), enters the PO number into
         `input#bldr_order_filter`, clicks `input#cmdSearch`, opens `OrderDetail.asp`,
-        and scrapes builder, address, taskDescription, and amount fields.
+        and scrapes builder, address, taskDescription, amount, and completion availability.
         """
         if not self._page:
             raise RuntimeError("Browser is not initialized.")
@@ -888,13 +1388,12 @@ class SupplyProPortalDriver:
 
         target = self._active_target()
 
-        detail_link_selectors = [
-            f"a:has-text('{po_number}')",
-            "a[href*='OrderDetail.asp']",
-            "a[href*='orderdetail.asp']",
-            "a:has-text('Details')",
-        ]
-        detail_link = self._find_visible_locator(target, detail_link_selectors, timeout=12000)
+        detail_link = self._select_best_order_detail_link(
+            target,
+            po_number=po_number,
+            is_reinspect=is_reinspect,
+            internal_inspection_type=internal_inspection_type,
+        )
         if detail_link is not None:
             logger.info("Opening Order Details page for PO %s...", po_number)
             with self._page.expect_navigation(wait_until="domcontentloaded", timeout=30000):
@@ -924,6 +1423,9 @@ class SupplyProPortalDriver:
         amount_str = extracted_fields.get("amount", "")
         numeric_amount = self._parse_currency(amount_str)
 
+        action_available = self._is_complete_order_action_available(target)
+        already_complete = self._is_order_already_complete(target, action_select_present=action_available)
+
         scraped_payload = {
             "poNumber": po_number,
             "pageUrl": self._page.url,
@@ -933,6 +1435,9 @@ class SupplyProPortalDriver:
             "amount": numeric_amount if numeric_amount is not None else amount_str,
             "amountText": amount_str,
             "orderStatus": extracted_fields.get("status", ""),
+            "isAlreadyComplete": already_complete,
+            "isActionAvailable": True if already_complete else action_available,
+            "isCsrBlocked": (not already_complete) and (not action_available),
             "rawPageText": raw_text[:12000],
         }
         return scraped_payload
@@ -1159,7 +1664,9 @@ class SupplyProPortalDriver:
             if self._is_order_already_complete(target, action_select_present=False):
                 logger.info("Order is already Complete in SupplyPro — skipping")
                 return "Already Complete"
-            raise RuntimeError("Could not locate 'Complete Order' action selector on Order Details page.")
+            raise SupplyProCsrBlockedError(
+                "Exception: CSR Blocked / Action Unavailable in SupplyPro"
+            )
 
         update_btn_selectors = [
             "input[type='button'][value='Update']",
@@ -1245,21 +1752,48 @@ STRICT 4-FACTOR MATCHING RULES:
 """
 
 
-def _build_audit_system_instruction(prompt_instructions: Optional[str] = None) -> str:
+def _build_audit_system_instruction(
+    prompt_instructions: Optional[str] = None,
+    task_mappings: Optional[list[dict[str, Any]]] = None,
+    is_reinspect: bool = False,
+) -> str:
     """
-    Combines the base 4-factor reconciliation system instruction with optional
-    job-specific promptInstructions under 'Additional Job-Specific Business Rules & Aliases'.
+    Combines the base 4-factor reconciliation system instruction with active
+    `ai.SupplyProTaskMappings` rules, reinspect constraints, and optional
+    job-specific `promptInstructions`.
     """
     base = AUDIT_SYSTEM_INSTRUCTION.strip()
-    extra = (prompt_instructions or "").strip()
-    if not extra:
-        return base
-    return (
-        f"{base}\n\n"
-        f"Additional Job-Specific Business Rules & Aliases:\n"
-        f"{extra}\n"
-        f"(Note: The 4-factor JSON output schema and the exact $0.00 fee match rule remain mandatory.)"
+    mappings_block = ""
+    if task_mappings:
+        lines = []
+        for m in task_mappings:
+            b_label = m.get("builderName") or "GLOBAL (All Builders)"
+            lines.append(
+                f"  - Builder: {b_label} | Internal TypeName: {m.get('internalInspectionType')!r} "
+                f"<-> SupplyPro Task: {m.get('supplyProTaskName')!r}"
+            )
+        mappings_block = (
+            "\n\nAuthorized SQL Task Equivalences (`BORE.ai.SupplyProTaskMappings` - ONLY permitted non-exact task equivalences):\n"
+            + "\n".join(lines)
+        )
+
+    reinspect_guard = (
+        "\n\nCRITICAL REINSPECTION & FIRST-TIME GUARDRAILS:\n"
+        f"- Current order Reinspect bit (`is_reinspect`): {bool(is_reinspect)}\n"
+        "- When `is_reinspect` is False (`Reinspect = 0`), you MUST REJECT (`inspectionTypeMatch = false`) any "
+        "SupplyPro task containing reinspection terminology (`Reinspect`, `Reinspection`, `Re-Inspect`) OR tagged "
+        "with `-1`, `(1)`, or `First-Time` / `First Time`.\n"
+        "- Only approve non-exact inspection type names if they match an authorized equivalence in `ai.SupplyProTaskMappings`."
     )
+
+    extra = (prompt_instructions or "").strip()
+    extra_block = (
+        f"\n\nAdditional Job-Specific Business Rules & Aliases:\n{extra}\n"
+        "(Note: The 4-factor JSON output schema and the exact $0.00 fee match rule remain mandatory.)"
+        if extra
+        else ""
+    )
+    return f"{base}{mappings_block}{reinspect_guard}{extra_block}"
 
 
 def audit_order_with_gemini(
@@ -1271,6 +1805,8 @@ def audit_order_with_gemini(
     user_note: Optional[str] = None,
     cost_tracker: Optional[CostTracker] = None,
     model_name: str = DEFAULT_GEMINI_MODEL,
+    task_mappings: Optional[list[dict[str, Any]]] = None,
+    is_reinspect: Optional[bool] = None,
 ) -> SupplyProAuditResult:
     """
     Performs a 4-factor semantic comparison between the internal Burgess record (`expected`)
@@ -1278,6 +1814,11 @@ def audit_order_with_gemini(
     token usage and cost telemetry via `CostTracker` and `TokenTelemetry`.
     """
     active_model = (model_name or DEFAULT_GEMINI_MODEL).strip() or DEFAULT_GEMINI_MODEL
+    effective_reinspect = (
+        bool(is_reinspect)
+        if is_reinspect is not None
+        else _extract_reinspect_bool(expected)
+    )
     use_vertex = os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE").strip().upper() == "TRUE"
     client = genai.Client(
         vertexai=use_vertex,
@@ -1295,6 +1836,7 @@ def audit_order_with_gemini(
         "builderName": expected.get("builderName"),
         "propertyAddress": expected.get("propertyAddress"),
         "inspectionType": expected.get("inspectionType"),
+        "reinspect": effective_reinspect,
         "fee": f"{expected_fee_dec:.2f}" if expected_fee_dec is not None else None,
         "invoiceNumber": expected.get("invoiceNumber"),
         "dbRecordFound": expected.get("dbRecordFound", True),
@@ -1309,7 +1851,7 @@ def audit_order_with_gemini(
     prompt = f"""
 Perform a 4-factor reconciliation audit for Purchase Order #{po_label}.
 
-1. EXPECTED (Internal Burgess Database Record - `ai.VW_AccountingExtractRevenue`):
+1. EXPECTED (Internal Burgess Database Record - `ai.vw_AccountingExtract`):
 {json.dumps(expected_clean, indent=2, default=str)}
 
 2. SCRAPED (SupplyPro Order Detail Page):
@@ -1330,7 +1872,11 @@ Evaluate `builderMatch`, `addressMatch`, `inspectionTypeMatch`, `feeMatch`, `ove
             f"Accountant Override Note (treat as authoritative context for this order): {cleaned_user_note}\n"
         )
 
-    system_instruction = _build_audit_system_instruction(prompt_instructions)
+    system_instruction = _build_audit_system_instruction(
+        prompt_instructions=prompt_instructions,
+        task_mappings=task_mappings,
+        is_reinspect=effective_reinspect,
+    )
 
     response = client.models.generate_content(
         model=active_model,
@@ -1420,6 +1966,157 @@ Evaluate `builderMatch`, `addressMatch`, `inspectionTypeMatch`, `feeMatch`, `ove
     return verdict
 
 
+def validate_supplypro_task(
+    internal_inspection_type: str,
+    supplypro_task_name: str,
+    is_reinspect: bool,
+    builder_name: Optional[str] = None,
+    task_mappings: Optional[list[dict[str, Any]]] = None,
+    expected_record: Optional[dict[str, Any]] = None,
+    scraped_data: Optional[dict[str, Any]] = None,
+    po_number: Optional[str] = None,
+    telemetry: Optional[TokenTelemetry] = None,
+    cost_tracker: Optional[CostTracker] = None,
+    model_name: str = DEFAULT_GEMINI_MODEL,
+    prompt_instructions: Optional[str] = None,
+    user_note: Optional[str] = None,
+) -> tuple[bool, SupplyProAuditResult]:
+    """
+    Validates the SupplyPro task against `internal_inspection_type` and `is_reinspect`
+    following Rules 1.1–1.5 & 4.3:
+
+    - If `is_reinspect` is True (`Reinspect = 1`):
+        1. Check explicit active mappings in `ai.SupplyProTaskMappings` (matching `BuilderName` +
+           `InternalInspectionType` first, then global `BuilderName IS NULL` rules, such as
+           Rule 1.3 `Final - Davidson Homes-2 -> Q.I. Reinspect`) — $0.00 AI cost.
+        2. Otherwise, accept any SupplyPro PO task whose name contains reinspection terminology
+           (`reinspect`, `reinspection`, `re-inspect`, `re-inspection`, case-insensitive) — $0.00 AI cost.
+        3. Reject standard/first-time SupplyPro PO tasks that do NOT indicate a reinspection.
+
+    - If `is_reinspect` is False (`Reinspect = 0`):
+        1. Reject SupplyPro PO tasks containing reinspection terminology (`reinspect`, `reinspection`, etc.)
+           AND reject SupplyPro PO tasks tagged with `-1`, `(1)`, or `First-Time` (case-insensitive) — $0.00 AI cost.
+        2. Compare `TypeName` (`internal_inspection_type`) against `supplypro_task_name` using:
+           (a) exact case-insensitive match ($0.00 AI cost),
+           (b) active rules in `ai.SupplyProTaskMappings` ($0.00 AI cost), or
+           (c) guarded Gemini fallback passing `ai.SupplyProTaskMappings` as the only permitted equivalences.
+    """
+    int_type = (internal_inspection_type or "").strip()
+    sp_task = (supplypro_task_name or "").strip()
+    mismatch_note = (
+        f"Exception: Inspection Type Mismatch "
+        f"(Reinspect={int(bool(is_reinspect))}, Internal: '{int_type}' vs SupplyPro: '{sp_task}')"
+    )
+
+    def _deterministic_verdict(matched: bool, notes: str) -> SupplyProAuditResult:
+        return SupplyProAuditResult(
+            builderMatch=True,
+            addressMatch=True,
+            inspectionTypeMatch=matched,
+            feeMatch=True,
+            overallMatch=matched,
+            confidenceScore=1.0 if matched else 0.0,
+            discrepancies=[] if matched else [mismatch_note],
+            auditNotes=notes if matched else mismatch_note,
+        )
+
+    if is_reinspect:
+        # 1. Explicit active mappings in ai.SupplyProTaskMappings ($0.00 AI cost)
+        mapped = match_sql_task_mapping(
+            internal_inspection_type=int_type,
+            supplypro_task_name=sp_task,
+            builder_name=builder_name,
+            task_mappings=task_mappings,
+            is_reinspect=True,
+        )
+        if mapped is not None:
+            note = (
+                f"Matched SQL task mapping for reinspection "
+                f"('{mapped.get('internalInspectionType')}' -> '{mapped.get('supplyProTaskName')}')."
+            )
+            return True, _deterministic_verdict(True, note)
+
+        # 2. Any SupplyPro task containing reinspection terminology ($0.00 AI cost)
+        if is_reinspection_task_name(sp_task):
+            note = f"Matched reinspection terminology in SupplyPro task '{sp_task}' (Reinspect=1)."
+            return True, _deterministic_verdict(True, note)
+
+        # 3. Reject standard/first-time tasks when Reinspect=1
+        return False, _deterministic_verdict(False, mismatch_note)
+
+    # is_reinspect is False (Reinspect = 0)
+    # 1. Reject reinspection terminology and -1 / (1) / First-Time tags deterministically ($0.00 AI cost)
+    if is_reinspection_task_name(sp_task) or has_forbidden_first_time_tag(sp_task):
+        return False, _deterministic_verdict(False, mismatch_note)
+
+    # 2(a). Exact case-insensitive match ($0.00 AI cost)
+    if int_type and sp_task and int_type.lower() == sp_task.lower():
+        note = f"Exact case-insensitive inspection type match ('{int_type}' == '{sp_task}')."
+        return True, _deterministic_verdict(True, note)
+
+    # 2(b). Active rules in ai.SupplyProTaskMappings ($0.00 AI cost)
+    mapped = match_sql_task_mapping(
+        internal_inspection_type=int_type,
+        supplypro_task_name=sp_task,
+        builder_name=builder_name,
+        task_mappings=task_mappings,
+        is_reinspect=False,
+    )
+    if mapped is not None:
+        note = (
+            f"Matched SQL task mapping "
+            f"('{mapped.get('internalInspectionType')}' -> '{mapped.get('supplyProTaskName')}')."
+        )
+        return True, _deterministic_verdict(True, note)
+
+    # 2(c). Guarded Gemini fallback
+    exp_dict = dict(expected_record or {})
+    exp_dict.setdefault("builderName", builder_name or "")
+    exp_dict.setdefault("inspectionType", int_type)
+    exp_dict["reinspect"] = False
+
+    scr_dict = dict(scraped_data or {})
+    scr_dict.setdefault("taskDescription", sp_task)
+
+    audit_kwargs: dict[str, Any] = {
+        "expected": exp_dict,
+        "scraped": scr_dict,
+        "po_number": po_number or exp_dict.get("poNumber"),
+        "telemetry": telemetry,
+        "prompt_instructions": prompt_instructions,
+    }
+    if user_note:
+        audit_kwargs["user_note"] = user_note
+
+    sig_params = inspect.signature(audit_order_with_gemini).parameters
+    if "cost_tracker" in sig_params:
+        audit_kwargs["cost_tracker"] = cost_tracker
+    if "model_name" in sig_params and model_name != DEFAULT_GEMINI_MODEL:
+        audit_kwargs["model_name"] = model_name
+    if "task_mappings" in sig_params:
+        audit_kwargs["task_mappings"] = task_mappings
+    if "is_reinspect" in sig_params:
+        audit_kwargs["is_reinspect"] = False
+
+    verdict = audit_order_with_gemini(**audit_kwargs)
+    if telemetry is not None and cost_tracker is not None:
+        if telemetry.input_tokens == 0 and cost_tracker.total_input_tokens > 0:
+            telemetry.sync_from_cost_tracker(cost_tracker)
+        elif telemetry.input_tokens > 0 and cost_tracker.total_input_tokens == 0:
+            cost_tracker.total_input_tokens = telemetry.input_tokens
+            cost_tracker.total_output_tokens = telemetry.output_tokens
+            cost_tracker.total_cost = telemetry.estimated_cost_usd
+
+    if not verdict.inspectionTypeMatch:
+        verdict.overallMatch = False
+        verdict.auditNotes = mismatch_note
+        if mismatch_note not in verdict.discrepancies:
+            verdict.discrepancies = [mismatch_note] + list(verdict.discrepancies)
+        return False, verdict
+
+    return True, verdict
+
+
 def _print_reconciliation_report(
     po_number: str,
     expected: dict[str, Any],
@@ -1481,6 +2178,121 @@ def _is_session_redirect_error(err: Exception, driver: Any) -> bool:
             pass
     msg = str(err).lower()
     return "login.asp" in msg or "session redirected to login" in msg or "session expired" in msg
+
+
+def _is_csr_blocked_error(err: Exception) -> bool:
+    """Returns True if the exception indicates a CSR-blocked or unavailable Complete Order action."""
+    if isinstance(err, SupplyProCsrBlockedError):
+        return True
+    msg = str(err).lower()
+    return (
+        "csr blocked" in msg
+        or "action unavailable in supplypro" in msg
+        or "could not locate 'complete order' action selector" in msg
+    )
+
+
+def _is_scraped_order_already_complete(scraped_data: dict[str, Any]) -> bool:
+    """Returns True if the scraped OrderDetail payload indicates the order is already Complete."""
+    if scraped_data.get("isAlreadyComplete") is True:
+        return True
+    status_str = str(scraped_data.get("orderStatus") or "").strip().lower()
+    if status_str in ("complete", "completed"):
+        return True
+    raw_text = str(scraped_data.get("rawPageText") or "")
+    if re.search(r"(?:Order\s*Status|Status)\s*[:\-]?\s*Complete(?:d)?\b", raw_text, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _is_scraped_order_csr_blocked(scraped_data: dict[str, Any]) -> bool:
+    """
+    Returns True if the Order Details page shows the order is NOT already Complete
+    and the 'Complete Order' action is missing or disabled (CSR blocked).
+    """
+    if _is_scraped_order_already_complete(scraped_data):
+        return False
+    if scraped_data.get("isCsrBlocked") is True or scraped_data.get("csrBlocked") is True:
+        return True
+    if scraped_data.get("isActionAvailable") is False or scraped_data.get("actionAvailable") is False:
+        return True
+    return False
+
+
+def _scrape_po_with_session_recovery(
+    driver: Any,
+    po_number: str,
+    is_reinspect: bool = False,
+    internal_inspection_type: Optional[str] = None,
+) -> dict[str, Any]:
+    """
+    Calls `driver.search_and_scrape_order` for `po_number` with automatic session re-login
+    if SupplyPro redirects to `login.asp`.
+    """
+    def _invoke_scrape() -> dict[str, Any]:
+        sig_params = inspect.signature(driver.search_and_scrape_order).parameters
+        kwargs: dict[str, Any] = {}
+        if "is_reinspect" in sig_params:
+            kwargs["is_reinspect"] = is_reinspect
+        if "internal_inspection_type" in sig_params:
+            kwargs["internal_inspection_type"] = internal_inspection_type
+        return driver.search_and_scrape_order(po_number, **kwargs)
+
+    try:
+        scraped = _invoke_scrape()
+        if hasattr(driver, "is_session_expired") and callable(driver.is_session_expired) and driver.is_session_expired():
+            raise SupplyProSessionExpiredError(
+                f"SupplyPro redirected to login screen after scraping PO {po_number}."
+            )
+        return scraped
+    except Exception as first_err:
+        if not _is_not_found_error(first_err) and _is_session_redirect_error(first_err, driver):
+            logger.warning(
+                "SupplyPro session expired on PO %s (%s); re-authenticating and retrying once...",
+                po_number,
+                first_err,
+            )
+            driver.login()
+            progress_logger.info("Re-authenticated into SupplyPro after session timeout")
+            return _invoke_scrape()
+        raise
+
+
+def _search_po_with_fallback(
+    driver: Any,
+    po_item: NormalizedPOLookup,
+    is_reinspect: bool = False,
+    internal_inspection_type: Optional[str] = None,
+) -> tuple[str, dict[str, Any]]:
+    """
+    Two-Step SupplyPro Search (Rules 2.3 & 4.1):
+    Searches SupplyPro using `po_item.primary_po`. If zero results return and
+    `po_item.fallback_po` is set, immediately retries with `po_item.fallback_po`.
+    Returns `(matched_po, scraped_data)` or raises `SupplyProOrderNotFoundError`.
+    """
+    try:
+        scraped = _scrape_po_with_session_recovery(
+            driver,
+            po_item.primary_po,
+            is_reinspect=is_reinspect,
+            internal_inspection_type=internal_inspection_type,
+        )
+        return po_item.primary_po, scraped
+    except Exception as primary_err:
+        if _is_not_found_error(primary_err) and po_item.fallback_po:
+            logger.info(
+                "Primary PO %r not found in SupplyPro; retrying with fallback PO %r...",
+                po_item.primary_po,
+                po_item.fallback_po,
+            )
+            scraped = _scrape_po_with_session_recovery(
+                driver,
+                po_item.fallback_po,
+                is_reinspect=is_reinspect,
+                internal_inspection_type=internal_inspection_type,
+            )
+            return po_item.fallback_po, scraped
+        raise
 
 
 def _resolve_marked_orders(
@@ -1724,17 +2536,30 @@ def run_supplypro_sync(
             return SkillExecutionResult(
                 status="Completed",
                 records_processed=0,
+                records_exception=0,
                 records_failed=0,
                 output_summary=empty_summary,
                 details=[],
                 telemetry=TokenTelemetry(),
             )
 
+        extra_task_mappings = _get_case_insensitive(
+            unpacked_params,
+            "taskMappings",
+            "task_mappings",
+            "SupplyProTaskMappings",
+            "supplypro_task_mappings",
+        )
+        task_mappings = load_supplypro_task_mappings(
+            extra_mappings=extra_task_mappings if isinstance(extra_task_mappings, list) else None
+        )
+
         driver = SupplyProPortalDriver(params=parsed_params, dry_run=dry_run)
         active_cost_tracker = cost_tracker if cost_tracker is not None else CostTracker(model_name=parsed_params.model_name)
         telemetry = TokenTelemetry()
         details_list: list[dict[str, Any]] = []
         processed_count = 0
+        exception_count = 0
         failed_count = 0
         order_summaries: list[str] = []
 
@@ -1744,8 +2569,8 @@ def run_supplypro_sync(
             progress_logger.info("Logged into SupplyPro")
 
             for idx, expected_record in enumerate(orders_to_process, start=1):
-                target_po = str(expected_record.get("poNumber") or "").strip()
-                if not target_po:
+                raw_po = str(expected_record.get("poNumber") or "").strip()
+                if not raw_po:
                     continue
 
                 invoice_num = (
@@ -1755,256 +2580,420 @@ def run_supplypro_sync(
                 )
                 inspection_id = expected_record.get("inspectionId")
                 expected_fee = expected_record.get("fee")
+                total_fee_float = float(expected_fee) if expected_fee is not None else 0.0
+                is_reinspect = _extract_reinspect_bool(expected_record)
+                internal_inspection_type = str(expected_record.get("inspectionType") or "").strip()
+                builder_name = str(expected_record.get("builderName") or "").strip()
                 item_user_note = expected_record.get("userNote") or active_user_note
                 item_extract_type = expected_record.get("extractType") or parsed_params.extract_type
+
+                po_items = normalize_and_split_po(raw_po, total_fee_float)
+                if not po_items:
+                    continue
 
                 # Check before navigating whether SupplyPro redirected back to login.asp
                 if hasattr(driver, "ensure_authenticated") and callable(driver.ensure_authenticated):
                     driver.ensure_authenticated()
 
-                try:
+                validated_children: list[dict[str, Any]] = []
+                group_exception_notes: list[str] = []
+                technical_crash_err: Optional[Exception] = None
+                last_scraped_data: dict[str, Any] = {}
+                last_audit_verdict: Optional[SupplyProAuditResult] = None
+                total_scraped_fee: float = 0.0
+                any_scraped_fee: bool = False
+
+                # Phase 1: Validate ALL child POs first (Atomic Dual-PO Validation — Rule 3.1)
+                for child_po in po_items:
+                    searched_desc = (
+                        f"{child_po.primary_po}, fallback: {child_po.fallback_po}"
+                        if child_po.fallback_po
+                        else child_po.primary_po
+                    )
                     try:
-                        scraped_data = driver.search_and_scrape_order(target_po)
-                        if hasattr(driver, "is_session_expired") and callable(driver.is_session_expired) and driver.is_session_expired():
-                            raise SupplyProSessionExpiredError(
-                                f"SupplyPro redirected to login screen after scraping PO {target_po}."
-                            )
-                    except Exception as first_scrape_err:
-                        if not _is_not_found_error(first_scrape_err) and _is_session_redirect_error(first_scrape_err, driver):
-                            logger.warning(
-                                "SupplyPro session expired on PO %s (%s); re-authenticating and retrying once...",
-                                target_po,
-                                first_scrape_err,
-                            )
-                            driver.login()
-                            progress_logger.info("Re-authenticated into SupplyPro after session timeout")
-                            scraped_data = driver.search_and_scrape_order(target_po)
-                        else:
-                            raise
-
-                    audit_kwargs: dict[str, Any] = {
-                        "expected": expected_record,
-                        "scraped": scraped_data,
-                        "po_number": target_po,
-                        "telemetry": telemetry,
-                        "prompt_instructions": parsed_params.prompt_instructions,
-                    }
-                    if item_user_note:
-                        audit_kwargs["user_note"] = item_user_note
-                    if "cost_tracker" in inspect.signature(audit_order_with_gemini).parameters:
-                        audit_kwargs["cost_tracker"] = active_cost_tracker
-                    if "model_name" in inspect.signature(audit_order_with_gemini).parameters and parsed_params.model_name != DEFAULT_GEMINI_MODEL:
-                        audit_kwargs["model_name"] = parsed_params.model_name
-
-                    audit_verdict = audit_order_with_gemini(**audit_kwargs)
-                    if telemetry.input_tokens == 0 and active_cost_tracker.total_input_tokens > 0:
-                        telemetry.sync_from_cost_tracker(active_cost_tracker)
-                    elif telemetry.input_tokens > 0 and active_cost_tracker.total_input_tokens == 0:
-                        # Support unit tests that mock audit_order_with_gemini and mutate `telemetry` directly
-                        active_cost_tracker.total_input_tokens = telemetry.input_tokens
-                        active_cost_tracker.total_output_tokens = telemetry.output_tokens
-                        active_cost_tracker.total_cost = telemetry.estimated_cost_usd
-                except Exception as po_err:
-                    if _is_not_found_error(po_err):
-                        not_found_note = "PO not found in SupplyPro portal"
-                        logger.warning("PO %s not found in SupplyPro portal: %s", target_po, po_err)
-                        failed_count += 1
-                        row_status = "NotFound (Dry-Run)" if dry_run else "NotFound"
-                        if not dry_run:
-                            try:
-                                client.log_supplypro_reconciliation({
-                                    "executionId": active_execution_id,
-                                    "inspectionId": inspection_id,
-                                    "extractType": item_extract_type,
-                                    "poNumber": target_po,
-                                    "invoiceNumber": str(invoice_num) if invoice_num else None,
-                                    "status": "NotFound",
-                                    "expectedAmount": float(expected_fee) if expected_fee is not None else None,
-                                    "scrapedAmount": None,
-                                    "auditNotes": not_found_note,
-                                })
-                            except Exception as log_err:
-                                logger.error("Failed to log NotFound status for PO %s: %s", target_po, log_err)
-
-                        details_list.append({
-                            "PONumber": target_po,
-                            "InvoiceNumber": str(invoice_num),
-                            "BuilderExpected": expected_record.get("builderName") or "",
-                            "BuilderScraped": "",
-                            "InspectionExpected": expected_record.get("inspectionType") or "",
-                            "TaskScraped": "",
-                            "FeeExpected": expected_fee,
-                            "FeeScraped": None,
-                            "Status": row_status,
-                            "ConfidenceScore": 0.0,
-                            "Discrepancies": [not_found_note],
-                            "AuditNotes": not_found_note,
-                            "overallMatch": False,
-                        })
-                        order_summaries.append(f"PO {target_po}: NOT FOUND ({not_found_note})")
-                        progress_logger.info(
-                            "[%d/%d] PO %s -> NotFound (%s)",
-                            idx,
-                            total_orders,
-                            target_po,
-                            not_found_note,
+                        matched_po, scraped_data = _search_po_with_fallback(
+                            driver,
+                            po_item=child_po,
+                            is_reinspect=is_reinspect,
+                            internal_inspection_type=internal_inspection_type,
                         )
-                        continue
+                        last_scraped_data = scraped_data
+                    except Exception as search_err:
+                        if _is_not_found_error(search_err):
+                            missing_note = f"Exception: Missing PO in SupplyPro (searched: {searched_desc})"
+                            logger.warning("PO %s missing in SupplyPro: %s", raw_po, missing_note)
+                            group_exception_notes.append(missing_note)
+                            break
+                        if _is_csr_blocked_error(search_err):
+                            csr_note = "Exception: CSR Blocked / Action Unavailable in SupplyPro"
+                            logger.warning("PO %s CSR blocked in SupplyPro: %s", raw_po, search_err)
+                            group_exception_notes.append(csr_note)
+                            break
+                        technical_crash_err = search_err
+                        break
 
+                    already_complete = _is_scraped_order_already_complete(scraped_data)
+                    if not already_complete and _is_scraped_order_csr_blocked(scraped_data):
+                        csr_note = "Exception: CSR Blocked / Action Unavailable in SupplyPro"
+                        logger.warning("PO %s is CSR blocked / action unavailable on OrderDetail.asp", matched_po)
+                        group_exception_notes.append(csr_note)
+                        break
+
+                    scraped_amt_dec = _to_cents(
+                        scraped_data.get("amount")
+                        if scraped_data.get("amount") is not None
+                        else scraped_data.get("amountText")
+                    )
+                    supplypro_fee = float(scraped_amt_dec) if scraped_amt_dec is not None else None
+                    if supplypro_fee is not None:
+                        total_scraped_fee = round(total_scraped_fee + supplypro_fee, 2)
+                        any_scraped_fee = True
+
+                    # Rule 4.2: Deterministic Fee Comparison (full fee for single POs, split fee for dual POs)
+                    if expected_fee is not None:
+                        if supplypro_fee is None or abs(float(child_po.expected_fee) - supplypro_fee) > 0.01:
+                            sp_val = supplypro_fee if supplypro_fee is not None else 0.0
+                            fee_note = (
+                                f"Exception: Fee Discrepancy "
+                                f"(Internal: ${float(child_po.expected_fee):.2f} vs SupplyPro: ${sp_val:.2f})"
+                            )
+                            logger.warning("Fee discrepancy on PO %s: %s", matched_po, fee_note)
+                            group_exception_notes.append(fee_note)
+                            break
+
+                    # Rules 1.1–1.5 & 4.3: Reinspection Bit Rules + SQL Task Mapping + Guarded Gemini Fallback
+                    supplypro_task_name = str(scraped_data.get("taskDescription") or "").strip()
+                    child_expected_rec = dict(expected_record)
+                    child_expected_rec["poNumber"] = matched_po
+                    child_expected_rec["fee"] = child_po.expected_fee
+                    child_expected_rec["reinspect"] = is_reinspect
+
+                    try:
+                        task_ok, audit_verdict = validate_supplypro_task(
+                            internal_inspection_type=internal_inspection_type,
+                            supplypro_task_name=supplypro_task_name,
+                            is_reinspect=is_reinspect,
+                            builder_name=builder_name,
+                            task_mappings=task_mappings,
+                            expected_record=child_expected_rec,
+                            scraped_data=scraped_data,
+                            po_number=matched_po,
+                            telemetry=telemetry,
+                            cost_tracker=active_cost_tracker,
+                            model_name=parsed_params.model_name,
+                            prompt_instructions=parsed_params.prompt_instructions,
+                            user_note=item_user_note,
+                        )
+                        last_audit_verdict = audit_verdict
+                    except Exception as audit_err:
+                        technical_crash_err = audit_err
+                        break
+
+                    _print_reconciliation_report(
+                        po_number=matched_po,
+                        expected=child_expected_rec,
+                        scraped=scraped_data,
+                        audit_verdict=audit_verdict,
+                        telemetry=telemetry,
+                        dry_run=dry_run,
+                    )
+
+                    if not task_ok:
+                        task_note = (
+                            f"Exception: Inspection Type Mismatch "
+                            f"(Reinspect={int(bool(is_reinspect))}, Internal: '{internal_inspection_type}' vs SupplyPro: '{supplypro_task_name}')"
+                        )
+                        logger.warning("Inspection type mismatch on PO %s: %s", matched_po, task_note)
+                        group_exception_notes.append(task_note)
+                        break
+
+                    if not audit_verdict.overallMatch:
+                        disc_str = "; ".join(audit_verdict.discrepancies) or audit_verdict.auditNotes
+                        exc_note = disc_str if disc_str.startswith("Exception:") else f"Exception: {disc_str}"
+                        logger.warning("Audit mismatch on PO %s: %s", matched_po, exc_note)
+                        group_exception_notes.append(exc_note)
+                        break
+
+                    validated_children.append(
+                        {
+                            "po_item": child_po,
+                            "matched_po": matched_po,
+                            "scraped_data": scraped_data,
+                            "already_complete": already_complete,
+                            "supplypro_fee": supplypro_fee,
+                            "audit_verdict": audit_verdict,
+                        }
+                    )
+
+                # Handle technical/Playwright crash strictly as `Failed`
+                if technical_crash_err is not None:
                     if single_order_mode:
-                        raise
-                    logger.error("Error processing PO %s in batch: %s", target_po, po_err)
+                        raise technical_crash_err
+                    logger.error("Technical error processing PO %s in batch: %s", raw_po, technical_crash_err)
                     failed_count += 1
-                    err_note = f"Portal scrape/audit error: {type(po_err).__name__}: {po_err}"
+                    err_note = f"Technical error: {type(technical_crash_err).__name__}: {technical_crash_err}"
                     if not dry_run:
                         try:
                             client.log_supplypro_reconciliation({
                                 "executionId": active_execution_id,
                                 "inspectionId": inspection_id,
                                 "extractType": item_extract_type,
-                                "poNumber": target_po,
+                                "poNumber": raw_po,
                                 "invoiceNumber": str(invoice_num) if invoice_num else None,
-                                "status": "FlaggedForReview",
+                                "status": "Failed",
                                 "expectedAmount": float(expected_fee) if expected_fee is not None else None,
-                                "scrapedAmount": None,
+                                "scrapedAmount": total_scraped_fee if any_scraped_fee else None,
                                 "auditNotes": err_note,
                             })
                         except Exception as log_err:
-                            logger.error("Failed to log reconciliation error for PO %s: %s", target_po, log_err)
+                            logger.error("Failed to log technical crash for PO %s: %s", raw_po, log_err)
 
                     details_list.append({
-                        "PONumber": target_po,
+                        "PONumber": raw_po,
                         "InvoiceNumber": str(invoice_num),
-                        "BuilderExpected": expected_record.get("builderName") or "",
-                        "BuilderScraped": "",
-                        "InspectionExpected": expected_record.get("inspectionType") or "",
-                        "TaskScraped": "",
+                        "BuilderExpected": builder_name,
+                        "BuilderScraped": last_scraped_data.get("builder") or "",
+                        "InspectionExpected": internal_inspection_type,
+                        "TaskScraped": last_scraped_data.get("taskDescription") or "",
                         "FeeExpected": expected_fee,
-                        "FeeScraped": None,
-                        "Status": "FlaggedForReview",
+                        "FeeScraped": total_scraped_fee if any_scraped_fee else None,
+                        "Status": "Failed",
                         "ConfidenceScore": 0.0,
                         "Discrepancies": [err_note],
                         "AuditNotes": err_note,
                         "overallMatch": False,
                     })
-                    order_summaries.append(f"PO {target_po}: ERROR ({po_err})")
+                    order_summaries.append(f"PO {raw_po}: FAILED ({technical_crash_err})")
                     progress_logger.info(
-                        "[%d/%d] PO %s -> FlaggedForReview (%s)",
+                        "[%d/%d] PO %s -> Failed (%s)",
                         idx,
                         total_orders,
-                        target_po,
+                        raw_po,
                         err_note,
                     )
                     continue
 
-                _print_reconciliation_report(
-                    po_number=target_po,
-                    expected=expected_record,
-                    scraped=scraped_data,
-                    audit_verdict=audit_verdict,
-                    telemetry=telemetry,
-                    dry_run=dry_run,
-                )
-
-                scraped_amt_dec = _to_cents(scraped_data.get("amount"))
-                scraped_amt_float = float(scraped_amt_dec) if scraped_amt_dec is not None else None
-
-                if audit_verdict.overallMatch:
-                    reconcile_status = "Reconciled"
-                    row_status = "Reconciled (Dry-Run)" if dry_run else "Reconciled"
-                    portal_action_result = "DryRun"
+                # Phase 2: Atomic Completion Gate — only complete if EVERY child PO passed validation
+                if not group_exception_notes and len(validated_children) == len(po_items):
+                    portal_results: list[str] = []
                     if not dry_run:
-                        portal_action_result = driver.complete_order_on_portal(
-                            invoice_number=str(invoice_num or target_po)
-                        )
-                    processed_count += 1
-                    fee_display = (
-                        f"${scraped_amt_float:.2f}"
-                        if scraped_amt_float is not None
-                        else (f"${float(expected_fee):.2f}" if expected_fee is not None else "N/A")
-                    )
-                    if portal_action_result == "Already Complete":
-                        row_status = "Already Complete"
-                        if "already complete" not in (audit_verdict.auditNotes or "").lower():
-                            audit_verdict.auditNotes = (
-                                f"Already Complete | {audit_verdict.auditNotes}"
-                                if audit_verdict.auditNotes
-                                else "Already Complete"
-                            )
-                        order_summaries.append(
-                            f"PO {target_po}: ALREADY COMPLETE (Invoice={invoice_num or 'N/A'}, Confidence={audit_verdict.confidenceScore:.2f})"
-                        )
-                        progress_logger.info(
-                            "[%d/%d] PO %s -> Already Complete (%s)",
-                            idx,
-                            total_orders,
-                            target_po,
-                            fee_display,
-                        )
+                        try:
+                            for child_idx, v_child in enumerate(validated_children):
+                                if v_child["already_complete"]:
+                                    logger.info(
+                                        "Order %s is already Complete in SupplyPro — skipping",
+                                        v_child["matched_po"],
+                                    )
+                                    portal_results.append("Already Complete")
+                                    continue
+
+                                # For dual-PO splits with multiple open children, navigate back to earlier child POs before completing
+                                if len(validated_children) > 1 and child_idx < len(validated_children) - 1:
+                                    _scrape_po_with_session_recovery(
+                                        driver,
+                                        v_child["matched_po"],
+                                        is_reinspect=is_reinspect,
+                                        internal_inspection_type=internal_inspection_type,
+                                    )
+                                elif len(validated_children) > 1 and child_idx == len(validated_children) - 1:
+                                    # If an earlier child was completed, the page navigated away from the last child
+                                    if any(r == "Completed" for r in portal_results):
+                                        _scrape_po_with_session_recovery(
+                                            driver,
+                                            v_child["matched_po"],
+                                            is_reinspect=is_reinspect,
+                                            internal_inspection_type=internal_inspection_type,
+                                        )
+
+                                action_res = driver.complete_order_on_portal(
+                                    invoice_number=str(invoice_num or v_child["matched_po"])
+                                )
+                                portal_results.append(action_res)
+                        except Exception as complete_err:
+                            if _is_csr_blocked_error(complete_err):
+                                group_exception_notes.append(
+                                    "Exception: CSR Blocked / Action Unavailable in SupplyPro"
+                                )
+                            else:
+                                if single_order_mode:
+                                    raise
+                                logger.error(
+                                    "Technical error completing PO %s on SupplyPro: %s",
+                                    raw_po,
+                                    complete_err,
+                                )
+                                failed_count += 1
+                                err_note = f"Technical error: {type(complete_err).__name__}: {complete_err}"
+                                if not dry_run:
+                                    try:
+                                        client.log_supplypro_reconciliation({
+                                            "executionId": active_execution_id,
+                                            "inspectionId": inspection_id,
+                                            "extractType": item_extract_type,
+                                            "poNumber": raw_po,
+                                            "invoiceNumber": str(invoice_num) if invoice_num else None,
+                                            "status": "Failed",
+                                            "expectedAmount": float(expected_fee) if expected_fee is not None else None,
+                                            "scrapedAmount": total_scraped_fee if any_scraped_fee else None,
+                                            "auditNotes": err_note,
+                                        })
+                                    except Exception as log_err:
+                                        logger.error("Failed to log completion crash for PO %s: %s", raw_po, log_err)
+                                details_list.append({
+                                    "PONumber": raw_po,
+                                    "InvoiceNumber": str(invoice_num),
+                                    "BuilderExpected": builder_name,
+                                    "BuilderScraped": last_scraped_data.get("builder") or "",
+                                    "InspectionExpected": internal_inspection_type,
+                                    "TaskScraped": last_scraped_data.get("taskDescription") or "",
+                                    "FeeExpected": expected_fee,
+                                    "FeeScraped": total_scraped_fee if any_scraped_fee else None,
+                                    "Status": "Failed",
+                                    "ConfidenceScore": 0.0,
+                                    "Discrepancies": [err_note],
+                                    "AuditNotes": err_note,
+                                    "overallMatch": False,
+                                })
+                                order_summaries.append(f"PO {raw_po}: FAILED ({complete_err})")
+                                progress_logger.info(
+                                    "[%d/%d] PO %s -> Failed (%s)",
+                                    idx,
+                                    total_orders,
+                                    raw_po,
+                                    err_note,
+                                )
+                                continue
                     else:
-                        order_summaries.append(
-                            f"PO {target_po}: MATCH (Invoice={invoice_num or 'N/A'}, Confidence={audit_verdict.confidenceScore:.2f})"
-                        )
-                        progress_logger.info(
-                            "[%d/%d] PO %s -> Reconciled (%s)",
-                            idx,
-                            total_orders,
-                            target_po,
-                            fee_display,
-                        )
-                else:
-                    reconcile_status = "FlaggedForReview"
-                    row_status = "FlaggedForReview (Dry-Run)" if dry_run else "FlaggedForReview"
-                    failed_count += 1
-                    discrepancies_str = "; ".join(audit_verdict.discrepancies) or "See auditNotes"
-                    logger.warning(
-                        "Execution gate blocked SupplyPro modification for PO %s: %s",
-                        target_po,
-                        discrepancies_str,
-                    )
-                    order_summaries.append(
-                        f"PO {target_po}: FLAGGED ({discrepancies_str})"
-                    )
+                        for v_child in validated_children:
+                            portal_results.append(
+                                "Already Complete" if v_child["already_complete"] else "DryRun"
+                            )
+
+                # Record Exception if any validation or CSR-blocked check triggered
+                if group_exception_notes:
+                    exception_count += 1
+                    reconcile_status = "Exception"
+                    row_status = "Exception (Dry-Run)" if dry_run else "Exception"
+                    combined_exc_note = " | ".join(group_exception_notes)
+
+                    if not dry_run:
+                        try:
+                            client.log_supplypro_reconciliation({
+                                "executionId": active_execution_id,
+                                "inspectionId": inspection_id,
+                                "extractType": item_extract_type,
+                                "poNumber": raw_po,
+                                "invoiceNumber": str(invoice_num) if invoice_num else None,
+                                "status": reconcile_status,
+                                "expectedAmount": float(expected_fee) if expected_fee is not None else None,
+                                "scrapedAmount": total_scraped_fee if any_scraped_fee else None,
+                                "auditNotes": combined_exc_note,
+                            })
+                        except Exception as log_err:
+                            logger.error("Failed to log Exception status for PO %s: %s", raw_po, log_err)
+
+                    details_list.append({
+                        "PONumber": raw_po,
+                        "InvoiceNumber": str(invoice_num),
+                        "BuilderExpected": builder_name,
+                        "BuilderScraped": last_scraped_data.get("builder") or "",
+                        "InspectionExpected": internal_inspection_type,
+                        "TaskScraped": last_scraped_data.get("taskDescription") or "",
+                        "FeeExpected": expected_fee,
+                        "FeeScraped": total_scraped_fee if any_scraped_fee else None,
+                        "Status": row_status,
+                        "ConfidenceScore": 0.0,
+                        "Discrepancies": group_exception_notes,
+                        "AuditNotes": combined_exc_note,
+                        "overallMatch": False,
+                    })
+                    order_summaries.append(f"PO {raw_po}: EXCEPTION ({combined_exc_note})")
                     progress_logger.info(
-                        "[%d/%d] PO %s -> FlaggedForReview (%s)",
+                        "[%d/%d] PO %s -> Exception (%s)",
                         idx,
                         total_orders,
-                        target_po,
-                        discrepancies_str,
+                        raw_po,
+                        combined_exc_note,
+                    )
+                    continue
+
+                # All child POs validated and completed (or skipped as Already Complete)
+                processed_count += 1
+                reconcile_status = "Reconciled"
+                all_already_complete = bool(portal_results) and all(r == "Already Complete" for r in portal_results)
+                row_status = (
+                    "Already Complete"
+                    if all_already_complete
+                    else ("Reconciled (Dry-Run)" if dry_run else "Reconciled")
+                )
+                fee_display = (
+                    f"${total_scraped_fee:.2f}"
+                    if any_scraped_fee
+                    else (f"${float(expected_fee):.2f}" if expected_fee is not None else "N/A")
+                )
+                final_verdict = last_audit_verdict or SupplyProAuditResult(
+                    builderMatch=True,
+                    addressMatch=True,
+                    inspectionTypeMatch=True,
+                    feeMatch=True,
+                    overallMatch=True,
+                    confidenceScore=1.0,
+                    discrepancies=[],
+                    auditNotes="All checks passed.",
+                )
+                final_notes = final_verdict.auditNotes
+                if all_already_complete:
+                    if "already complete" not in (final_notes or "").lower():
+                        final_notes = f"Already Complete | {final_notes}" if final_notes else "Already Complete"
+                    order_summaries.append(
+                        f"PO {raw_po}: ALREADY COMPLETE (Invoice={invoice_num or 'N/A'}, Confidence={final_verdict.confidenceScore:.2f})"
+                    )
+                    progress_logger.info(
+                        "[%d/%d] PO %s -> Already Complete (%s)",
+                        idx,
+                        total_orders,
+                        raw_po,
+                        fee_display,
+                    )
+                else:
+                    order_summaries.append(
+                        f"PO {raw_po}: MATCH (Invoice={invoice_num or 'N/A'}, Confidence={final_verdict.confidenceScore:.2f})"
+                    )
+                    progress_logger.info(
+                        "[%d/%d] PO %s -> Reconciled (%s)",
+                        idx,
+                        total_orders,
+                        raw_po,
+                        fee_display,
                     )
 
                 if not dry_run:
-                    notes_with_discrepancies = audit_verdict.auditNotes
-                    if audit_verdict.discrepancies:
-                        disc_joined = "; ".join(audit_verdict.discrepancies)
-                        notes_with_discrepancies = f"Discrepancies: {disc_joined} | {audit_verdict.auditNotes}"
-
                     client.log_supplypro_reconciliation({
                         "executionId": active_execution_id,
                         "inspectionId": inspection_id,
                         "extractType": item_extract_type,
-                        "poNumber": target_po,
+                        "poNumber": raw_po,
                         "invoiceNumber": str(invoice_num) if invoice_num else None,
                         "status": reconcile_status,
                         "expectedAmount": float(expected_fee) if expected_fee is not None else None,
-                        "scrapedAmount": scraped_amt_float,
-                        "auditNotes": notes_with_discrepancies,
+                        "scrapedAmount": total_scraped_fee if any_scraped_fee else None,
+                        "auditNotes": final_notes,
                     })
 
                 row_detail = {
-                    "PONumber": target_po,
+                    "PONumber": raw_po,
                     "InvoiceNumber": str(invoice_num),
-                    "BuilderExpected": expected_record.get("builderName") or "",
-                    "BuilderScraped": scraped_data.get("builder") or "",
-                    "InspectionExpected": expected_record.get("inspectionType") or "",
-                    "TaskScraped": scraped_data.get("taskDescription") or "",
+                    "BuilderExpected": builder_name,
+                    "BuilderScraped": last_scraped_data.get("builder") or "",
+                    "InspectionExpected": internal_inspection_type,
+                    "TaskScraped": last_scraped_data.get("taskDescription") or "",
                     "FeeExpected": expected_fee,
-                    "FeeScraped": scraped_amt_float if scraped_amt_float is not None else scraped_data.get("amount"),
+                    "FeeScraped": total_scraped_fee if any_scraped_fee else last_scraped_data.get("amount"),
                     "Status": row_status,
-                    "ConfidenceScore": audit_verdict.confidenceScore,
-                    "Discrepancies": audit_verdict.discrepancies,
-                    "AuditNotes": audit_verdict.auditNotes,
-                    **audit_verdict.model_dump(),
+                    "ConfidenceScore": final_verdict.confidenceScore,
+                    "Discrepancies": final_verdict.discrepancies,
+                    "AuditNotes": final_notes,
+                    **final_verdict.model_dump(),
                 }
                 details_list.append(row_detail)
 
@@ -2013,7 +3002,8 @@ def run_supplypro_sync(
                 f"({telemetry.total_tokens:,} total) | Est. Cost: ${telemetry.estimated_cost_usd:.6f} USD"
             )
             summary = (
-                f"{mode_prefix}SupplyPro Reconciliation ({processed_count} reconciled, {failed_count} flagged) | "
+                f"{mode_prefix}SupplyPro Reconciliation "
+                f"({processed_count} reconciled, {exception_count} exceptions, {failed_count} failed) | "
                 f"{' ; '.join(order_summaries)} | {telemetry_summary}"
             )
             logger.info(summary)
@@ -2021,6 +3011,7 @@ def run_supplypro_sync(
             return SkillExecutionResult(
                 status="Completed",
                 records_processed=processed_count,
+                records_exception=exception_count,
                 records_failed=failed_count,
                 output_summary=summary,
                 details=details_list,

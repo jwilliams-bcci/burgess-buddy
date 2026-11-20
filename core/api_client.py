@@ -359,19 +359,21 @@ class BurgessApiClient:
         estimated_cost: float = 0.0,
         input_tokens: int = 0,
         output_tokens: int = 0,
+        exceptions: int = 0,
     ) -> dict[str, Any]:
         """
         Reports execution completion metrics and status back to BurgessApi.
         Endpoint: POST /api/agent/jobs/{jobId}/executions/{executionId}/complete
         Body: {
-            status, recordsProcessed, recordsFailed, outputSummary, errorMessage,
-            estimatedCost, inputTokens, outputTokens
+            status, recordsProcessed, recordsFailed, recordsException,
+            outputSummary, errorMessage, estimatedCost, inputTokens, outputTokens
         }
         """
         payload = {
             "status": status,
             "recordsProcessed": int(processed),
             "recordsFailed": int(failed),
+            "recordsException": int(exceptions or 0),
             "outputSummary": summary or "",
             "errorMessage": error,
             "estimatedCost": round(float(estimated_cost or 0.0), 6),
@@ -379,11 +381,12 @@ class BurgessApiClient:
             "outputTokens": int(output_tokens or 0),
         }
         logger.info(
-            "Completing execution_id=%s for job_id=%s with status=%s (processed=%s, failed=%s, cost=$%.4f, inputTokens=%s, outputTokens=%s)",
+            "Completing execution_id=%s for job_id=%s with status=%s (processed=%s, exceptions=%s, failed=%s, cost=$%.4f, inputTokens=%s, outputTokens=%s)",
             execution_id,
             job_id,
             status,
             processed,
+            payload["recordsException"],
             failed,
             payload["estimatedCost"],
             payload["inputTokens"],
@@ -549,7 +552,7 @@ class BurgessApiClient:
                 if payload.get("invoiceNumber") not in (None, "")
                 else None
             ),
-            "status": str(payload.get("status") or "FlaggedForReview"),
+            "status": str(payload.get("status") or "Exception"),
             "expectedAmount": (
                 float(payload["expectedAmount"])
                 if payload.get("expectedAmount") is not None

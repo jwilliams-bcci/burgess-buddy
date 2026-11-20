@@ -646,9 +646,11 @@ def execute_job(
                         "Skipping Emailer report delivery because 0 pending orders were processed in this batch."
                     )
 
+            exception_count = int(getattr(result, "records_exception", 0) or 0)
             progress_logger.info(
-                "Execution complete (processed=%d, failed=%d, cost=$%.4f)",
+                "Execution complete (processed=%d, exceptions=%d, failed=%d, cost=$%.4f)",
                 result.records_processed,
+                exception_count,
                 result.records_failed,
                 cost_tracker.total_cost,
             )
@@ -667,13 +669,15 @@ def execute_job(
                 estimated_cost=round(cost_tracker.total_cost, 6),
                 input_tokens=cost_tracker.total_input_tokens,
                 output_tokens=cost_tracker.total_output_tokens,
+                exceptions=exception_count,
             )
             logger.info(
-                "Job %s (executionId=%s) finished with status=%s (processed=%d, failed=%d, cost=$%.4f).",
+                "Job %s (executionId=%s) finished with status=%s (processed=%d, exceptions=%d, failed=%d, cost=$%.4f).",
                 job_id,
                 active_execution_id,
                 result.status,
                 result.records_processed,
+                exception_count,
                 result.records_failed,
                 cost_tracker.total_cost,
             )
